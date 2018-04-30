@@ -164,6 +164,8 @@ data ConnectionRequestResponse =
   | ConnectionRequestCrossed
     -- | /A/ gave an incorrect host (did not match the host that /B/ observed).
   | ConnectionRequestHostMismatch
+    -- | /B/ Is waiting for /A/ to start a TLS handshake
+  | TLSHandshake
   deriving (Show)
 
 decodeConnectionRequestResponse :: Word32 -> Maybe ConnectionRequestResponse
@@ -173,6 +175,7 @@ decodeConnectionRequestResponse w32 = case w32 of
   0x00000001 -> Just ConnectionRequestInvalid
   0x00000002 -> Just ConnectionRequestCrossed
   0x00000003 -> Just ConnectionRequestHostMismatch
+  0x00000004 -> Just TLSHandshake
   _          -> Nothing
 
 encodeConnectionRequestResponse :: ConnectionRequestResponse -> Word32
@@ -182,6 +185,7 @@ encodeConnectionRequestResponse crr = case crr of
   ConnectionRequestInvalid            -> 0x00000001
   ConnectionRequestCrossed            -> 0x00000002
   ConnectionRequestHostMismatch       -> 0x00000003
+  TLSHandshake                        -> 0x00000004
 
 -- | Generate an EndPointAddress which does not encode a host/port/endpointid.
 -- Such addresses are used for unreachable endpoints, and for ephemeral
@@ -317,7 +321,7 @@ recvExact sock len = go [] len
     go acc l = do
       bs <- NBS.recv sock (fromIntegral l `min` smallChunkSize)
       if BS.null bs
-        then throwIO (userError "recvExact: Socket closed")
+        then throwIO (userError $ show l ++ ": recvExact: Socket closed")
         else go (bs : acc) (l - fromIntegral (BS.length bs))
 
 -- | Get the numeric host, resolved host (via getNameInfo), and port from a

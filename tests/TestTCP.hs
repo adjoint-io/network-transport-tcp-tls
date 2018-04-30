@@ -134,6 +134,7 @@ testEarlyDisconnect = do
       theirAddr <- readMVar clientAddr
 
       -- TEST 1: they connect to us, then drop the connection
+      putStrLn "   TEST 1:"
       do
         ConnectionOpened _ _ addr <- receive endpoint
         True <- return $ addr == theirAddr
@@ -143,6 +144,7 @@ testEarlyDisconnect = do
 
         return ()
 
+      putStrLn "   TEST 2:"
       -- TEST 2: after they dropped their connection to us, we now try to
       -- establish a connection to them. This should re-establish the broken
       -- TCP connection.

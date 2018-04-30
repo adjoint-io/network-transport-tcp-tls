@@ -14,6 +14,7 @@
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Network.Transport.TCP
   ( -- * Main API
@@ -102,10 +103,14 @@ import qualified Network.Socket as N
   , SockAddr(..)
   )
 
+import qualified Network.TLS as TLS
+import qualified Network.TLS.Extra.Cipher as TLS
+import qualified Data.X509.Validation as X509
+
 #ifdef USE_MOCK_NETWORK
-import Network.Transport.TCP.Mock.Socket.ByteString (sendMany)
+import Network.Transport.TCP.Mock.Socket.ByteString (sendMany, sendAll)
 #else
-import Network.Socket.ByteString (sendMany)
+import Network.Socket.ByteString (sendMany, sendAll)
 #endif
 
 import Control.Concurrent
@@ -149,9 +154,10 @@ import Control.Exception
   )
 import Data.IORef (IORef, newIORef, writeIORef, readIORef, writeIORef)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS (concat, length, null)
+import qualified Data.ByteString as BS (concat, length, null, empty, splitAt, cons)
 import qualified Data.ByteString.Char8 as BSC (pack, unpack)
 import Data.Bits (shiftL, (.|.))
+import Data.Default (def)
 import Data.Maybe (isJust)
 import Data.Word (Word32)
 import Data.Set (Set)
@@ -171,6 +177,7 @@ import Data.Accessor (Accessor, accessor, (^.), (^=), (^:))
 import qualified Data.Accessor.Container as DAC (mapMaybe)
 import Data.Foldable (forM_, mapM_)
 import qualified System.Timeout (timeout)
+import qualified System.Directory as D (getCurrentDirectory)
 
 -- $design
 --
@@ -452,6 +459,9 @@ data ValidRemoteEndPointState = ValidRemoteEndPointState
   , _remoteLastIncoming  :: !LightweightConnectionId
   , _remoteNextConnOutId :: !LightweightConnectionId
   ,  remoteSocket        :: !N.Socket
+     -- | A TLS Context for establishing secure data transmission over the TCP
+     -- connection between two endpoints
+  ,  remoteTLSContext    :: TLS.Context
      -- | When the connection is being probed, yields an IO action that can be
      -- used to release any resources dedicated to the probing.
   ,  remoteProbing       :: Maybe (IO ())
@@ -1081,8 +1091,20 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
             probeIfValid theirEndPoint
           else do
             sendLock <- newMVar ()
+
+            -- Establish a TLS Server context since this is the endpoint
+            -- receiving a connection request.
+            let serverBackend = mkBackend sock sendLock (tcpMaxReceiveLength $ transportParams transport)
+
+            eServerParams <- mkServerParams "server_cert.pem" "server_key.pem"
+            serverParams <- case eServerParams of
+              Left err -> throwIO (userError (show err))
+              Right serverParams' -> pure serverParams'
+            serverTLSContext <- TLS.contextNew serverBackend serverParams
+
             let vst = ValidRemoteEndPointState
                         {  remoteSocket        = sock
+                        ,  remoteTLSContext    = serverTLSContext
                         ,  remoteSocketClosed  = socketClosed
                         ,  remoteProbing       = Nothing
                         ,  remoteSendLock      = sendLock
@@ -1092,6 +1114,15 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
                         , _remoteNextConnOutId = firstNonReservedLightweightConnectionId
                         }
             sendMany sock [encodeWord32 (encodeConnectionRequestResponse ConnectionRequestAccepted)]
+
+            let ourAddrPref = "(" ++ show (localAddress ourEndPoint) ++ ") "
+            let tlsHandshake = do
+                  putStrLn $ "\n" ++ ourAddrPref ++ "Starting server TLS handshake..."
+                  TLS.handshake serverTLSContext
+                  putStrLn $ ourAddrPref ++ "Finished server TLS handshake."
+            catch tlsHandshake $ \(e :: SomeException) ->
+              throwIO $ userError (show e)
+
             -- resolveInit will update the shared state, and handleIncomingMessages
             -- will always ultimately clean up after it.
             -- Closing up the socket is also out of our hands. It will happen
@@ -1149,9 +1180,9 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
       RemoteEndPointInit _ _ _ ->
         relyViolation (ourEndPoint, theirEndPoint)
           "handleIncomingMessages (init)"
-      RemoteEndPointValid ep ->
+      RemoteEndPointValid ep -> do
         return . Right $ remoteSocket ep
-      RemoteEndPointClosing _ ep ->
+      RemoteEndPointClosing _ ep -> do
         return . Right $ remoteSocket ep
       RemoteEndPointClosed ->
         return . Left $ userError "handleIncomingMessages (already closed)"
@@ -1508,6 +1539,7 @@ createConnectionTo transport ourEndPoint theirAddress hints = do
         then do
           mr' <- handle (absorbAllExceptions Nothing) $
             setupRemoteEndPoint transport (ourEndPoint, theirEndPoint) connTimeout
+
           go timer (fmap ((,) theirEndPoint) mr')
         else do
           -- 'findRemoteEndPoint' will have increased 'remoteOutgoing'
@@ -1570,8 +1602,23 @@ setupRemoteEndPoint transport (ourEndPoint, theirEndPoint) connTimeout = do
       -- once handleIncomingMessages has finished.
       Right (socketClosedVar, sock, ConnectionRequestAccepted) -> do
         sendLock <- newMVar ()
+
+        -- Establish a client TLS context since this endpoint is the one
+        -- intiating the connection
+        let backend = mkBackend sock sendLock (tcpMaxReceiveLength $ transportParams transport)
+        clientTLSContext <- TLS.contextNew backend tlsClientParams
+
+        let ourAddrPref = "(" ++ show (localAddress ourEndPoint) ++ ") "
+        let tlsHandshake = do
+              putStrLn $ "\n" ++ ourAddrPref ++ "Starting client TLS handshake..."
+              TLS.handshake clientTLSContext
+              putStrLn $ ourAddrPref ++ "Finished client TLS handshake."
+        catch tlsHandshake $ \(e :: SomeException) ->
+          throwIO $ userError (show e)
+
         let vst = ValidRemoteEndPointState
                     {  remoteSocket        = sock
+                    ,  remoteTLSContext    = clientTLSContext
                     ,  remoteSocketClosed  = readMVar socketClosedVar
                     ,  remoteProbing       = Nothing
                     ,  remoteSendLock      = sendLock
@@ -2080,6 +2127,88 @@ createConnectionId :: HeavyweightConnectionId
                    -> ConnectionId
 createConnectionId hcid lcid =
   (fromIntegral hcid `shiftL` 32) .|. fromIntegral lcid
+
+--------------------------------------------------------------------------------
+-- TLS
+--------------------------------------------------------------------------------
+
+mkBackend :: N.Socket -> MVar () -> Word32 -> TLS.Backend
+mkBackend sock sendLock recvLimit = TLS.Backend
+  { TLS.backendClose = return ()
+  , TLS.backendFlush = return ()
+  , TLS.backendSend  = \bs ->
+      withMVar sendLock $ \_ ->
+        sendMany sock $ chunksOf (fromIntegral recvLimit) bs
+  , TLS.backendRecv =
+      TLS.backendRecv (TLS.getBackend sock)
+  }
+
+chunksOf :: Int -> ByteString -> [ByteString]
+chunksOf n bs
+  | BS.null bs = [BS.empty]
+  | otherwise  =
+      let (chunk,rest) = BS.splitAt n bs
+       in chunk : (chunksOf n rest)
+
+mkServerParams :: FilePath -> FilePath -> IO (Either IOException TLS.ServerParams)
+mkServerParams certFile keyFile = do
+  eServerShared <- mkShared certFile keyFile
+  pure $ case eServerShared of
+    Left err -> Left err
+    Right shared -> Right $ def
+      { TLS.serverSupported = supported
+      , TLS.serverShared    = shared
+  --  , TLS.serverHooks     = serverHooks
+      }
+  where
+  {- TODO To be used when client certificates are desired, e.g. for
+      network-access-token implementation on the
+
+    serverHooks :: TLS.ServerHooks
+    serverHooks = def
+      { TLS.onClientCertificate = \certChain -> do
+          fres <- validateDefault mempty def ("Uplink", mempty) certChain
+          pure $ case filter (/= SelfSigned) fres of
+            []    -> TLS.CertificateUsageAccept
+            (Expired:_)   -> TLS.CertificateUsageReject TLS.CertificateRejectExpired
+            (UnknownCA:_) -> TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
+            (reason:_)    -> TLS.CertificateUsageReject (TLS.CertificateRejectOther (show reason))
+      }
+  -}
+
+tlsClientParams :: TLS.ClientParams
+tlsClientParams =
+  (TLS.defaultParamsClient "Uplink" "")
+    { TLS.clientSupported = supported
+    , TLS.clientHooks     = clientHooks
+    }
+  where
+    clientHooks :: TLS.ClientHooks
+    clientHooks = def
+        { -- TLS.onCertificateRequest = \_ ->
+          TLS.onServerCertificate  = \cs vc cid ->
+            fmap ignoreSelfSigned . onServerCert cs vc cid
+        }
+      where
+        onServerCert = TLS.onServerCertificate def
+        ignoreSelfSigned = filter (/= X509.SelfSigned)
+
+supported :: TLS.Supported
+supported = def
+  { TLS.supportedCiphers = TLS.ciphersuite_default
+  , TLS.supportedVersions = [TLS.TLS12]
+  }
+
+-- Load Server or Client credentials
+mkShared :: FilePath -> FilePath -> IO (Either IOException TLS.Shared)
+mkShared certFile keyFile = do
+  eCred <- TLS.credentialLoadX509 certFile keyFile
+  pure $ case eCred of
+    Left err ->
+      Left $ userError $ "Failed to load server credentials: " ++ err
+    Right cred -> do
+      let creds = TLS.Credentials [cred]
+       in Right $ def { TLS.sharedCredentials = creds }
 
 --------------------------------------------------------------------------------
 -- Functions from TransportInternals                                          --
