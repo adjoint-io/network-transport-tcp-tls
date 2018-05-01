@@ -20,6 +20,9 @@ module Network.Transport.TCP.Internal
   , randomEndPointAddress
   , ProtocolVersion
   , currentProtocolVersion
+
+  , sendChunks
+  , recvChunks
   ) where
 
 #if ! MIN_VERSION_base(4,6,0)
@@ -66,9 +69,9 @@ import qualified Network.Socket as N
   )
 
 #ifdef USE_MOCK_NETWORK
-import qualified Network.Transport.TCP.Mock.Socket.ByteString as NBS (recv)
+import qualified Network.Transport.TCP.Mock.Socket.ByteString as NBS (recv, sendMany)
 #else
-import qualified Network.Socket.ByteString as NBS (recv)
+import qualified Network.Socket.ByteString as NBS (recv, sendMany)
 #endif
 
 import Data.Word (Word32, Word64)
@@ -97,7 +100,7 @@ import Control.Exception
 import Control.Applicative ((<$>), (<*>))
 import Data.Word (Word32)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS (length, concat, null)
+import qualified Data.ByteString as BS (length, concat, null, empty, splitAt)
 import Data.ByteString.Lazy.Internal (smallChunkSize)
 import Data.ByteString.Lazy (toStrict)
 import qualified Data.ByteString.Char8 as BSC (unpack, pack)
@@ -324,6 +327,23 @@ recvExact sock len = go [] len
         then throwIO (userError $ show l ++ ": recvExact: Socket closed")
         else go (bs : acc) (l - fromIntegral (BS.length bs))
 
+sendChunks :: Int -> N.Socket -> ByteString -> IO ()
+sendChunks chunkSize sock bs = do
+  let chunks = chunksOf chunkSize bs
+  NBS.sendMany sock chunks
+
+recvChunks :: Int -> N.Socket -> Int -> IO ByteString
+recvChunks chunkSize sock nbytes =
+    BS.concat <$> go [] (fromIntegral nbytes)
+  where
+    go :: [ByteString] -> Word32 -> IO [ByteString]
+    go acc 0 = return (reverse acc)
+    go acc l = do
+      bs <- NBS.recv sock (fromIntegral l `min` chunkSize)
+      if BS.null bs
+        then throwIO (userError $ show l ++ ": recvChunks: Socket closed")
+        else go (bs : acc) (l - fromIntegral (BS.length bs))
+
 -- | Get the numeric host, resolved host (via getNameInfo), and port from a
 -- SockAddr. The numeric host is first, then resolved host (which may be the
 -- same as the numeric host).
@@ -380,3 +400,10 @@ splitMaxFromEnd p = \n -> go [[]] n . reverse
       if p x then go ([] : acc : accs) (n - 1) xs
              else go ((x : acc) : accs) n xs
     go _ _ _ = error "Bug in splitMaxFromEnd"
+
+chunksOf :: Int -> ByteString -> [ByteString]
+chunksOf n bs
+  | BS.null bs = [BS.empty]
+  | otherwise  =
+      let (chunk,rest) = BS.splitAt n bs
+       in chunk : (chunksOf n rest)

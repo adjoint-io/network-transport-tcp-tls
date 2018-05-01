@@ -29,6 +29,8 @@ import Network.Transport.TCP ( createTransport
                              , tlsClientParams
                              , mkServerParams
                              , handshake
+                             , recvTLS
+                             , sendTLS'
                              )
 import Control.Concurrent (threadDelay, killThread, myThreadId)
 import Control.Concurrent.MVar ( MVar
@@ -137,7 +139,11 @@ tlsHandshakeClient :: N.Socket -> EndPointAddress -> IO TLS.Context
 tlsHandshakeClient sock clientAddr = do
   clientTLSContext <- TLS.contextNew sock tlsClientParams
   let ourAddrPref = "(" ++ show clientAddr ++ ") "
-  () <- TLS.handshake clientTLSContext
+  let tlsHandshake = do
+        putStrLn $ ourAddrPref ++ "Starting client TLS handshake..."
+        TLS.handshake clientTLSContext
+        putStrLn $ ourAddrPref ++ "Finished client TLS handshake."
+  () <- tlsHandshake
   pure clientTLSContext
 
 -- | Sets up a server TLS context and then initiates a handshake on the socket
@@ -149,7 +155,11 @@ tlsHandshakeServer sock serverAddr = do
     Right serverParams' -> pure serverParams'
   serverTLSContext <- TLS.contextNew sock serverParams
   let ourAddrPref = "(" ++ "client" ++ ") "
-  () <- TLS.handshake serverTLSContext
+  let tlsHandshake = do
+        putStrLn $ ourAddrPref ++ "Starting server TLS handshake..."
+        TLS.handshake serverTLSContext
+        putStrLn $ ourAddrPref ++ "Finished server TLS handshake."
+  () <- tlsHandshake
   pure serverTLSContext
 
 -- Test that the server gets a ConnectionClosed message when the client closes
@@ -238,23 +248,28 @@ testEarlyDisconnect = do
         let ourAddress = encodeEndPointAddress "127.0.0.1" port 1
         tlsCtxt <- tlsHandshakeServer sock ourAddress
 
-        -- Server opens  a logical connection
+        tlog "Client: Server opens a logical connection, recvs CreatedNewConnection"
         Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
         1024 <- recvWord32 sock :: IO LightweightConnectionId
 
         -- Server sends a message
+        tlog "Client: Server sends me a message, trying to recv it"
         1024 <- recvWord32 sock
-        ["ping"] <- recvWithLength maxBound sock
+        tlog "Client: Server sends me a message, trying to recv it 2"
+        "ping" <- recvTLS (tlsCtxt, sock) maxBound
 
         -- Reply
+        tlog "Client: Sending CreatedNewConnection to server"
         sendMany sock [
             encodeWord32 (encodeControlHeader CreatedNewConnection)
           , encodeWord32 10002
           ]
-        sendMany sock (encodeWord32 10002 : prependLength ["pong"])
+
+        sendMany sock [encodeWord32 10002]
+        sendTLS' (tlsCtxt, sock) "pong"
 
         -- Close the socket
-        N.sClose sock
+        N.close sock
 
       let ourAddress = encodeEndPointAddress "127.0.0.1" clientPort 0
       putMVar clientAddr ourAddress
@@ -276,7 +291,7 @@ testEarlyDisconnect = do
 
       -- Close the socket without closing the connection explicitly
       -- The server should receive an error event
-      N.sClose sock
+      N.close sock
 
 -- | Test the behaviour of a premature CloseSocket request
 testEarlyCloseSocket :: IO ()
@@ -323,6 +338,7 @@ testEarlyCloseSocket = do
       -- connections, so we won't agree and hence will receive an error when
       -- the socket gets closed
       do
+        tlog "Server: Sending 'ping' message"
         Right () <- send conn ["ping"]
 
         ConnectionOpened cid _ addr <- receive endpoint
@@ -366,15 +382,19 @@ testEarlyCloseSocket = do
         1024 <- recvWord32 sock :: IO LightweightConnectionId
 
         -- Server sends a message
+        tlog "Client: Waiting for 'ping' msg"
         1024 <- recvWord32 sock
-        ["ping"] <- recvWithLength maxBound sock
+        "ping" <- recvTLS (tlsCtxt, sock) maxBound
 
         -- Reply
+        tlog "Client: Sending 'pong' msg"
         sendMany sock [
             encodeWord32 (encodeControlHeader CreatedNewConnection)
           , encodeWord32 10002
           ]
-        sendMany sock (encodeWord32 10002 : prependLength ["pong"])
+
+        sendMany sock [encodeWord32 10002]
+        sendTLS' (tlsCtxt, sock) "pong"
 
         -- Send a CloseSocket even though there are still connections *in both
         -- directions*
@@ -382,7 +402,7 @@ testEarlyCloseSocket = do
             encodeWord32 (encodeControlHeader CloseSocket)
           , encodeWord32 1024
           ]
-        N.sClose sock
+        N.close sock
 
       let ourAddress = encodeEndPointAddress "127.0.0.1" clientPort 0
       putMVar clientAddr ourAddress
@@ -408,7 +428,7 @@ testEarlyCloseSocket = do
           encodeWord32 (encodeControlHeader CloseSocket)
         , encodeWord32 0
         ]
-      N.sClose sock
+      N.close sock
 
 -- | Test the creation of a transport with an invalid address
 testInvalidAddress :: IO ()
@@ -527,7 +547,7 @@ testIgnoreCloseSocket = do
         encodeWord32 (encodeControlHeader CloseSocket)
       , encodeWord32 1024
       ]
-    N.sClose sock
+    N.close sock
 
     putMVar clientDone ()
 
@@ -655,9 +675,9 @@ testUnnecessaryConnect numThreads = do
           -- We might get either Invalid or Crossed (the transport does not
           -- maintain enough history to be able to tell)
           Right (_, sock, ConnectionRequestInvalid) ->
-            N.sClose sock
+            N.close sock
           Right (_, sock, ConnectionRequestCrossed) ->
-            N.sClose sock
+            N.close sock
           Left _ ->
             return ()
         putMVar done ()
@@ -766,7 +786,7 @@ testReconnect = do
           -- is closed.
           Right connId' <- tryIO $ (recvWord32 sock :: IO LightweightConnectionId)
           True <- return $ connId == connId'
-          Right ["ping"] <- tryIO $ recvWithLength maxBound sock
+          Right "ping" <- tryIO $ recvTLS (tlsCtxt, sock) maxBound
           putMVar serverDone ()
 
     return ()
@@ -875,7 +895,7 @@ testUnidirectionalError = do
 
       connId' <- recvWord32 sock :: IO LightweightConnectionId
       True <- return $ connId == connId'
-      ["ping"] <- recvWithLength maxBound sock
+      "ping" <- recvTLS (tlsCtxt, sock) maxBound
       putMVar serverGotPing ()
 
     -- Must read the clientDone MVar so that we don't close the socket
@@ -1096,9 +1116,9 @@ testCloseEndPoint = do
             encodeWord32 0x00000000
           , encodeWord32 (fromIntegral (BS.length (BS.concat v0handshake)))
           ]
-    sendMany sock $
-      handshake ++ v0handshake
 
+    -- Send handshake data to server
+    sendMany sock $ handshake ++ v0handshake
     -- Receive ConnectionRequestAccepted response from server
     Just ConnectionRequestAccepted <- decodeConnectionRequestResponse <$> recvWord32 sock
 

@@ -37,7 +37,17 @@ module Network.Transport.TCP
   , QDisc(..)
   , simpleUnboundedQDisc
   , simpleOnePlaceQDisc
-    -- * Design notes
+
+  , mkBackend
+  , tlsClientParams
+  , mkServerParams
+
+    -- * TLS utils
+  , TLS.handshake
+  , sendTLS
+  , sendTLS'
+  , recvTLS
+  -- * Design notes
     -- $design
   ) where
 
@@ -59,6 +69,8 @@ import Network.Transport.TCP.Internal
   , forkServer
   , recvWithLength
   , recvExact
+  , sendChunks
+  , recvChunks
   , recvWord32
   , encodeWord32
   , tryCloseSocket
@@ -156,6 +168,7 @@ import Data.IORef (IORef, newIORef, writeIORef, readIORef, writeIORef)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS (concat, length, null, empty, splitAt, cons)
 import qualified Data.ByteString.Char8 as BSC (pack, unpack)
+import qualified Data.ByteString.Lazy as BSL
 import Data.Bits (shiftL, (.|.))
 import Data.Default (def)
 import Data.Maybe (isJust)
@@ -866,8 +879,9 @@ apiSend (ourEndPoint, theirEndPoint) connId connAlive payload =
         RemoteEndPointValid vst -> do
           alive <- readIORef connAlive
           if alive
-            then sched theirEndPoint $
-              sendOn vst (encodeWord32 connId : prependLength payload)
+            then sched theirEndPoint $ do
+              sendOn vst [encodeWord32 connId]
+              sendTLS vst (BS.concat payload)
             else throwIO $ TransportError SendClosed "Connection closed"
         RemoteEndPointClosing _ _ -> do
           alive <- readIORef connAlive
@@ -1094,13 +1108,11 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
 
             -- Establish a TLS Server context since this is the endpoint
             -- receiving a connection request.
-            let serverBackend = mkBackend sock sendLock (tcpMaxReceiveLength $ transportParams transport)
-
             eServerParams <- mkServerParams "server_cert.pem" "server_key.pem"
             serverParams <- case eServerParams of
               Left err -> throwIO (userError (show err))
               Right serverParams' -> pure serverParams'
-            serverTLSContext <- TLS.contextNew serverBackend serverParams
+            serverTLSContext <- TLS.contextNew sock serverParams
 
             let vst = ValidRemoteEndPointState
                         {  remoteSocket        = sock
@@ -1116,12 +1128,11 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
             sendMany sock [encodeWord32 (encodeConnectionRequestResponse ConnectionRequestAccepted)]
 
             let ourAddrPref = "(" ++ show (localAddress ourEndPoint) ++ ") "
-            let tlsHandshake = do
-                  putStrLn $ "\n" ++ ourAddrPref ++ "Starting server TLS handshake..."
-                  TLS.handshake serverTLSContext
+            let tlsHandshake_log = do
+                  putStrLn $ ourAddrPref ++ "Starting server TLS handshake..."
+                  tlsHandshake sendLock serverTLSContext
                   putStrLn $ ourAddrPref ++ "Finished server TLS handshake."
-            catch tlsHandshake $ \(e :: SomeException) ->
-              throwIO $ userError (show e)
+            () <- tlsHandshake_log
 
             -- resolveInit will update the shared state, and handleIncomingMessages
             -- will always ultimately clean up after it.
@@ -1172,7 +1183,7 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
 
     -- Use shared remote endpoint state to get a socket, or an appropriate
     -- exception in case it's neither valid nor closing.
-    acquire :: IO (Either IOError N.Socket)
+    acquire :: IO (Either IOError (TLS.Context, N.Socket))
     acquire = withMVar theirState $ \st -> case st of
       RemoteEndPointInvalid _ ->
         relyViolation (ourEndPoint, theirEndPoint)
@@ -1181,9 +1192,9 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
         relyViolation (ourEndPoint, theirEndPoint)
           "handleIncomingMessages (init)"
       RemoteEndPointValid ep -> do
-        return . Right $ remoteSocket ep
+        return . Right $ (remoteTLSContext ep, remoteSocket ep)
       RemoteEndPointClosing _ ep -> do
-        return . Right $ remoteSocket ep
+        return . Right $ (remoteTLSContext ep, remoteSocket ep)
       RemoteEndPointClosed ->
         return . Left $ userError "handleIncomingMessages (already closed)"
       RemoteEndPointFailed _ ->
@@ -1192,13 +1203,13 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
     -- 'Right' is the normal case in which there still is a live socket to
     -- the remote endpoint, and so 'act' was run and installed its own
     -- exception handler.
-    release :: Either IOError N.Socket -> IO ()
+    release :: Either IOError (TLS.Context, N.Socket) -> IO ()
     release (Left err) = prematureExit err
     release (Right _) = return ()
 
-    act :: Either IOError N.Socket -> IO ()
+    act :: Either IOError (TLS.Context, N.Socket) -> IO ()
     act (Left _) = return ()
-    act (Right sock) = go sock `catch` prematureExit
+    act (Right (tlsCtx, sock)) = go tlsCtx sock `catch` prematureExit
 
     -- Dispatch
     --
@@ -1208,24 +1219,25 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
     -- (because a 'send' failed) -- the individual handlers below will throw a
     -- user exception which is then caught and handled the same way as an
     -- exception thrown by 'recv'.
-    go :: N.Socket -> IO ()
-    go sock = do
+    go :: TLS.Context -> N.Socket -> IO ()
+    go tlsCtx sock = do
       lcid <- recvWord32 sock :: IO LightweightConnectionId
       if lcid >= firstNonReservedLightweightConnectionId
         then do
-          readMessage sock lcid
-          go sock
+          -- Read an encrypted message sent via TLS
+          readMessage (tlsCtx, sock) lcid
+          go tlsCtx sock
         else
           case decodeControlHeader lcid of
             Just CreatedNewConnection -> do
               recvWord32 sock >>= createdNewConnection
-              go sock
+              go tlsCtx sock
             Just CloseConnection -> do
               recvWord32 sock >>= closeConnection
-              go sock
+              go tlsCtx sock
             Just CloseSocket -> do
               didClose <- recvWord32 sock >>= closeSocket sock
-              unless didClose $ go sock
+              unless didClose $ go tlsCtx sock
             Just CloseEndPoint -> do
               let closeRemoteEndPoint vst = do
                     forM_ (remoteProbing vst) id
@@ -1250,10 +1262,10 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
                 _                           -> return s
             Just ProbeSocket -> do
               forkIO $ sendMany sock [encodeWord32 (encodeControlHeader ProbeSocketAck)]
-              go sock
+              go tlsCtx sock
             Just ProbeSocketAck -> do
               stopProbing
-              go sock
+              go tlsCtx sock
             Nothing ->
               throwIO $ userError "Invalid control request"
 
@@ -1414,10 +1426,10 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
     -- Read a message and output it on the endPoint's channel. By rights we
     -- should verify that the connection ID is valid, but this is unnecessary
     -- overhead
-    readMessage :: N.Socket -> LightweightConnectionId -> IO ()
-    readMessage sock lcid =
-      recvWithLength recvLimit sock >>=
-        qdiscEnqueue' ourQueue theirAddr . Received (connId lcid)
+    readMessage :: (TLS.Context, N.Socket) -> LightweightConnectionId -> IO ()
+    readMessage tlsCtxAndSock lcid =
+      recvTLS tlsCtxAndSock recvLimit >>= \bs ->
+        qdiscEnqueue' ourQueue theirAddr (Received (connId lcid) [bs])
 
     -- Stop probing a connection as a result of receiving a probe ack.
     stopProbing :: IO ()
@@ -1605,16 +1617,14 @@ setupRemoteEndPoint transport (ourEndPoint, theirEndPoint) connTimeout = do
 
         -- Establish a client TLS context since this endpoint is the one
         -- intiating the connection
-        let backend = mkBackend sock sendLock (tcpMaxReceiveLength $ transportParams transport)
-        clientTLSContext <- TLS.contextNew backend tlsClientParams
+        clientTLSContext <- TLS.contextNew sock tlsClientParams
 
         let ourAddrPref = "(" ++ show (localAddress ourEndPoint) ++ ") "
-        let tlsHandshake = do
-              putStrLn $ "\n" ++ ourAddrPref ++ "Starting client TLS handshake..."
-              TLS.handshake clientTLSContext
+        let tlsHandshake_log = do
+              putStrLn $ ourAddrPref ++ "Starting client TLS handshake..."
+              tlsHandshake sendLock clientTLSContext
               putStrLn $ ourAddrPref ++ "Finished client TLS handshake."
-        catch tlsHandshake $ \(e :: SomeException) ->
-          throwIO $ userError (show e)
+        () <- tlsHandshake_log
 
         let vst = ValidRemoteEndPointState
                     {  remoteSocket        = sock
@@ -1988,10 +1998,53 @@ findRemoteEndPoint ourEndPoint theirAddress findOrigin mtimer = go
       bracket (forkIO $ timer >> throwTo tid connectTimedout) killThread $
         const $ readMVar mv
 
+--------------------------------------------------------------------------------
+-- Sending Helpers
+--------------------------------------------------------------------------------
+
 -- | Send a payload over a heavyweight connection (thread safe)
 sendOn :: ValidRemoteEndPointState -> [ByteString] -> IO ()
 sendOn vst bs = withMVar (remoteSendLock vst) $ \() ->
   sendMany (remoteSocket vst) bs
+
+-- | Send a message over a TLS connection given a 'Network.TLS.Context'. The
+-- 'Network.TLS.Backend' object used by 'Network.TLS.sendData' from the
+-- `Network.TLS.Context' is already set up to use the send lock, so we do not
+-- have to guard this send with the send lock as in 'sendOn'.
+--
+-- This function first sends the length of the TLS packet so that the receiving
+-- end can enforce that the packet is not larger than the desired
+-- 'tcpMaxReceiveLength' configurable parameter.
+--
+-- This function is thread safe as it uses the send lock of the endpoint.
+sendTLS :: ValidRemoteEndPointState -> ByteString -> IO ()
+sendTLS vst bs =
+  withMVar (remoteSendLock vst) $ \() -> do
+    sendTLS' (remoteTLSContext vst, remoteSocket vst) bs
+
+-- | Raw TLS packet send.
+--
+-- This function first sends the length of the TLS packet so that the receiving
+-- end can enforce that the packet is not larger than the desired
+-- 'tcpMaxReceiveLength' configurable parameter.
+--
+-- Warning: Does not use a send lock, so this function is not thread safe.
+sendTLS' :: (TLS.Context, N.Socket) -> ByteString -> IO ()
+sendTLS' (tlsCtx, sock) bs = do
+  sendMany sock  [encodeWord32 (fromIntegral (BS.length bs))]
+  TLS.sendData tlsCtx (BSL.fromStrict bs)
+
+-- | Receive a TLS packet that is no bigger than the receive limit specified in
+-- the TCPParameters configuration of the network Transport. This function is
+-- the dual to 'sendTLS' and will only receive data reliably if it is paired
+-- with such a function on the sending node. I.e. If the client uses 'sendTLS',
+-- the server must receive data from the socket with 'recvTLS' and vice versa.
+recvTLS :: (TLS.Context, N.Socket) -> Word32 -> IO ByteString
+recvTLS (tlsCtx, sock) recvLimit = do
+  len <- recvWord32 sock
+  when (len > recvLimit) $
+    throwIO (userError "recvTLS: limit exceeded")
+  TLS.recvData tlsCtx
 
 --------------------------------------------------------------------------------
 -- Scheduling actions                                                         --
@@ -2129,26 +2182,25 @@ createConnectionId hcid lcid =
   (fromIntegral hcid `shiftL` 32) .|. fromIntegral lcid
 
 --------------------------------------------------------------------------------
--- TLS
+-- TLS Internals
 --------------------------------------------------------------------------------
 
-mkBackend :: N.Socket -> MVar () -> Word32 -> TLS.Backend
-mkBackend sock sendLock recvLimit = TLS.Backend
+mkBackend :: N.Socket -> TLS.Backend
+mkBackend sock = TLS.Backend
   { TLS.backendClose = return ()
   , TLS.backendFlush = return ()
-  , TLS.backendSend  = \bs ->
-      withMVar sendLock $ \_ ->
-        sendMany sock $ chunksOf (fromIntegral recvLimit) bs
+  , TLS.backendSend =
+      TLS.backendSend (TLS.getBackend sock)
   , TLS.backendRecv =
       TLS.backendRecv (TLS.getBackend sock)
   }
 
-chunksOf :: Int -> ByteString -> [ByteString]
-chunksOf n bs
-  | BS.null bs = [BS.empty]
-  | otherwise  =
-      let (chunk,rest) = BS.splitAt n bs
-       in chunk : (chunksOf n rest)
+-- | Thread safe TLS handshake
+tlsHandshake :: MVar () -> TLS.Context -> IO ()
+tlsHandshake sendLock tlsCtx =
+  withMVar sendLock $ \() ->
+    catch (TLS.handshake tlsCtx) $ \(e :: SomeException) ->
+      throwIO (userError (show e))
 
 mkServerParams :: FilePath -> FilePath -> IO (Either IOException TLS.ServerParams)
 mkServerParams certFile keyFile = do
