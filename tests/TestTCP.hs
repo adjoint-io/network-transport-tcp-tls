@@ -1,6 +1,9 @@
 {-# LANGUAGE RebindableSyntax, TemplateHaskell #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE RecursiveDo #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+
 module Main where
 
 import Prelude hiding
@@ -22,8 +25,12 @@ import Network.Transport.TCP ( createTransport
                              , TCPAddrInfo(..)
                              , TCPAddr(..)
                              , defaultTCPAddr
+                             , mkBackend
+                             , tlsClientParams
+                             , mkServerParams
+                             , handshake
                              )
-import Control.Concurrent (threadDelay, killThread)
+import Control.Concurrent (threadDelay, killThread, myThreadId)
 import Control.Concurrent.MVar ( MVar
                                , newEmptyMVar
                                , putMVar
@@ -37,10 +44,9 @@ import Control.Concurrent.MVar ( MVar
                                )
 import Control.Monad (replicateM, guard, forM_, replicateM_, when)
 import Control.Applicative ((<$>))
-import Control.Exception (throwIO, try, SomeException)
+import Control.Exception (throwIO, try, SomeException, catch)
 import Network.Transport.TCP ( socketToEndPoint )
 import Network.Transport.Internal ( prependLength
-                                  , tlog
                                   , tryIO
                                   , void
                                   )
@@ -59,6 +65,8 @@ import Network.Transport.TCP.Internal
   , decodeEndPointAddress
   )
 
+import qualified Network.TLS as TLS
+
 #ifdef USE_MOCK_NETWORK
 import qualified Network.Transport.TCP.Mock.Socket as N
 #else
@@ -67,6 +75,7 @@ import qualified Network.Socket as N
   ( sClose
   , ServiceName
   , Socket
+  , socketPort
   , AddrInfo
   , shutdown
   , ShutdownCmd(ShutdownSend)
@@ -87,7 +96,9 @@ import Network.Transport.TCP.Mock.Socket.ByteString (sendMany)
 import Network.Socket.ByteString (sendMany)
 #endif
 
-import qualified Data.ByteString as BS (length, concat)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+
+import qualified Data.ByteString as BS (ByteString, length, concat)
 import Data.String (fromString)
 import GHC.IO.Exception (ioe_errno)
 import Foreign.C.Error (Errno(..), eADDRNOTAVAIL)
@@ -110,6 +121,36 @@ instance Traceable N.AddrInfo where
 
 instance Traceable TransportInternals where
   trace = const Nothing
+
+instance Traceable TLS.Context where
+  trace _ = trace ("TLSContext" :: String)
+
+instance Traceable TLS.ServerParams where
+  trace _ = trace ("TLSServerParams" :: String)
+
+tlog msg = liftIO $ do
+  tid <- myThreadId
+  putStrLn $ show tid ++ ": "  ++ msg
+
+-- | Sets up a client TLS context and then initiates a handshake on the socket
+tlsHandshakeClient :: N.Socket -> EndPointAddress -> IO TLS.Context
+tlsHandshakeClient sock clientAddr = do
+  clientTLSContext <- TLS.contextNew sock tlsClientParams
+  let ourAddrPref = "(" ++ show clientAddr ++ ") "
+  () <- TLS.handshake clientTLSContext
+  pure clientTLSContext
+
+-- | Sets up a server TLS context and then initiates a handshake on the socket
+tlsHandshakeServer :: N.Socket -> EndPointAddress -> IO TLS.Context
+tlsHandshakeServer sock serverAddr = do
+  eServerParams <- mkServerParams "server_cert.pem" "server_key.pem"
+  serverParams <- case eServerParams of
+    Left err -> throwIO (userError (show err))
+    Right serverParams' -> pure serverParams'
+  serverTLSContext <- TLS.contextNew sock serverParams
+  let ourAddrPref = "(" ++ "client" ++ ") "
+  () <- TLS.handshake serverTLSContext
+  pure serverTLSContext
 
 -- Test that the server gets a ConnectionClosed message when the client closes
 -- the socket without sending an explicit control message to the server first
@@ -134,32 +175,35 @@ testEarlyDisconnect = do
       theirAddr <- readMVar clientAddr
 
       -- TEST 1: they connect to us, then drop the connection
-      putStrLn "   TEST 1:"
       do
+        tlog "Server: Trying to recv ConnectionOpened"
         ConnectionOpened _ _ addr <- receive endpoint
         True <- return $ addr == theirAddr
 
+        tlog "Server: Trying to recv EventConnectionLost"
         ErrorEvent (TransportError (EventConnectionLost addr') _) <- receive endpoint
         True <- return $ addr' == theirAddr
 
         return ()
 
-      putStrLn "   TEST 2:"
       -- TEST 2: after they dropped their connection to us, we now try to
       -- establish a connection to them. This should re-establish the broken
       -- TCP connection.
-      tlog "Trying to connect to client"
+      tlog "Server: Trying to connect to client"
       Right conn <- connect endpoint theirAddr ReliableOrdered defaultConnectHints
 
       -- TEST 3: To test the connection, we do a simple ping test; as before,
       -- however, the remote client won't close the connection nicely but just
       -- closes the socket
       do
+        tlog "Server: sending 'ping'"
         Right () <- send conn ["ping"]
 
+        tlog "Server: Trying to recv ConnectionOpened again..."
         ConnectionOpened cid _ addr <- receive endpoint
         True <- return $ addr == theirAddr
 
+        tlog "Server: Trying to recv pong msg"
         Received cid' ["pong"] <- receive endpoint
         True <- return $ cid == cid'
 
@@ -180,10 +224,19 @@ testEarlyDisconnect = do
 
       -- Listen for incoming messages
       (clientPort, _) <- forkServer "127.0.0.1" "0" 5 True throwIO throwIO $ \socketFree (sock, _) -> do
+
         -- Initial setup
+        tlog "Client: Trying to recv 0"
         0 <- recvWord32 sock
+        tlog "Client: Trying to recvWithLength"
         _ <- recvWithLength maxBound sock
+        tlog "Client: Sending ConnectionRequestAccepted"
         sendMany sock [encodeWord32 (encodeConnectionRequestResponse ConnectionRequestAccepted)]
+
+        -- Initiate the server TLS handshake on connection receipt
+        port <- show <$> N.socketPort sock
+        let ourAddress = encodeEndPointAddress "127.0.0.1" port 1
+        tlsCtxt <- tlsHandshakeServer sock ourAddress
 
         -- Server opens  a logical connection
         Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
@@ -206,10 +259,16 @@ testEarlyDisconnect = do
       let ourAddress = encodeEndPointAddress "127.0.0.1" clientPort 0
       putMVar clientAddr ourAddress
 
-      -- Connect to the server
-      Right (_, sock, ConnectionRequestAccepted) <- readMVar serverAddr >>= \addr -> socketToEndPoint (Just ourAddress) addr True False False Nothing Nothing
+      tlog "Client: Connect to the server"
+      Right (_, sock, ConnectionRequestAccepted) <-
+        readMVar serverAddr >>= \addr ->
+          socketToEndPoint (Just ourAddress) addr True False False Nothing Nothing
 
-      -- Open a new connection
+      -- Establish a client TLS context since this endpoint is the one
+      -- intiating the connection
+      ctxt <- tlsHandshakeClient sock ourAddress
+
+      tlog "Client: Open a new connection"
       sendMany sock [
           encodeWord32 (encodeControlHeader CreatedNewConnection)
         , encodeWord32 10003
@@ -297,6 +356,11 @@ testEarlyCloseSocket = do
         _ <- recvWithLength maxBound sock
         sendMany sock [encodeWord32 (encodeConnectionRequestResponse ConnectionRequestAccepted)]
 
+        -- Initiate the server TLS handshake on connection receipt
+        port <- show <$> N.socketPort sock
+        let ourAddress = encodeEndPointAddress "127.0.0.1" port 1
+        tlsCtxt <- tlsHandshakeServer sock ourAddress
+
         -- Server opens a logical connection
         Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
         1024 <- recvWord32 sock :: IO LightweightConnectionId
@@ -324,7 +388,13 @@ testEarlyCloseSocket = do
       putMVar clientAddr ourAddress
 
       -- Connect to the server
-      Right (_, sock, ConnectionRequestAccepted) <- readMVar serverAddr >>= \addr -> socketToEndPoint (Just ourAddress) addr True False False Nothing Nothing
+      Right (_, sock, ConnectionRequestAccepted) <-
+        readMVar serverAddr >>= \addr ->
+          socketToEndPoint (Just ourAddress) addr True False False Nothing Nothing
+
+      -- Establish a client TLS context since this endpoint is the one
+      -- intiating the connection
+      ctxt <- tlsHandshakeClient sock ourAddress
 
       -- Open a new connection
       sendMany sock [
@@ -418,8 +488,12 @@ testIgnoreCloseSocket = do
     theirAddress <- readMVar serverAddr
 
     -- Connect to the server
-    Right (_, sock, ConnectionRequestAccepted) <- socketToEndPoint (Just ourAddress) theirAddress True False False Nothing Nothing
+    Right (_, sock, ConnectionRequestAccepted) <-
+      socketToEndPoint (Just ourAddress) theirAddress True False False Nothing Nothing
     putMVar connectionEstablished ()
+
+    -- Initiate a TLS handshake with the server
+    tlsCtx <- tlsHandshakeClient sock ourAddress
 
     -- Server connects to us, and then closes the connection
     Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
@@ -506,6 +580,9 @@ testBlockAfterCloseSocket = do
     -- Connect to the server
     Right (_, sock, ConnectionRequestAccepted) <- socketToEndPoint (Just ourAddress) theirAddress True False False Nothing Nothing
     putMVar connectionEstablished ()
+
+    -- Initiate a TLS handshake with the client
+    tlsCtx <- tlsHandshakeClient sock ourAddress
 
     -- Server connects to us, and then closes the connection
     Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
@@ -670,6 +747,12 @@ testReconnect = do
       Right () <- tryIO $ sendMany sock [
           encodeWord32 (encodeConnectionRequestResponse ConnectionRequestAccepted)
         ]
+
+      -- Initiate the server TLS handshake on connection receipt
+      port <- show <$> N.socketPort sock
+      let ourAddress = encodeEndPointAddress "127.0.0.1" port 1
+      tlsCtxt <- tlsHandshakeServer sock ourAddress
+
       -- Client requests a logical connection
       when (count > 1) $ do
         -- On the third and fourth requests, a new logical connection is
@@ -781,6 +864,11 @@ testUnidirectionalError = do
       0 <- recvWord32 sock
       _ <- recvWithLength maxBound sock
       () <- sendMany sock [encodeWord32 (encodeConnectionRequestResponse ConnectionRequestAccepted)]
+
+      -- Initiate the server TLS handshake on connection receipt
+      port <- show <$> N.socketPort sock
+      let ourAddress = encodeEndPointAddress "127.0.0.1" port 1
+      tlsCtxt <- tlsHandshakeServer sock ourAddress
 
       Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
       connId <- recvWord32 sock :: IO LightweightConnectionId
@@ -995,8 +1083,9 @@ testCloseEndPoint = do
     addr:_ <- N.getAddrInfo (Just N.defaultHints) (Just hostName) (Just serviceName)
     sock <- N.socket (N.addrFamily addr) N.Stream N.defaultProtocol
     N.connect sock (N.addrAddress addr)
+
+    -- Version 0x00000000 handshake data.
     let endPointAddress = "127.0.0.1:0:0"
-        -- Version 0x00000000 handshake data.
         v0handshake = [
             encodeWord32 endPointId
           , encodeWord32 (fromIntegral (BS.length endPointAddress))
@@ -1008,12 +1097,20 @@ testCloseEndPoint = do
           , encodeWord32 (fromIntegral (BS.length (BS.concat v0handshake)))
           ]
     sendMany sock $
-         handshake
-      ++ v0handshake
-      ++ [ -- Create a lightweight connection.
-           encodeWord32 (encodeControlHeader CreatedNewConnection)
-         , encodeWord32 1024
-         ]
+      handshake ++ v0handshake
+
+    -- Receive ConnectionRequestAccepted response from server
+    Just ConnectionRequestAccepted <- decodeConnectionRequestResponse <$> recvWord32 sock
+
+    -- Initiate client TLS handshake
+    tlsCtx <- tlsHandshakeClient sock (encodeEndPointAddress "127.0.0.1" "0" 0)
+
+    sendMany sock
+      [ -- Create a lightweight connection.
+        encodeWord32 (encodeControlHeader CreatedNewConnection)
+      , encodeWord32 1024
+      ]
+
     readMVar serverFinished
     N.close sock
 
