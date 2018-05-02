@@ -26,8 +26,8 @@ import Network.Transport.TCP ( createTransport
                              , TCPAddr(..)
                              , defaultTCPAddr
                              , mkBackend
-                             , tlsClientParams
-                             , mkServerParams
+                             , mkTLSClientParams
+                             , mkTLSServerParams
                              , handshake
                              , recvTLS
                              , sendTLS'
@@ -74,8 +74,7 @@ import qualified Network.Transport.TCP.Mock.Socket as N
 #else
 import qualified Network.Socket as N
 #endif
-  ( sClose
-  , ServiceName
+  ( ServiceName
   , Socket
   , socketPort
   , AddrInfo
@@ -109,6 +108,8 @@ import Network.Transport.Tests (testTransport)
 import Network.Transport.Tests.Auxiliary (forkTry, runTests)
 import Network.Transport.Tests.Traced
 
+import System.IO
+
 instance Traceable ControlHeader where
   trace = traceShow
 
@@ -130,35 +131,42 @@ instance Traceable TLS.Context where
 instance Traceable TLS.ServerParams where
   trace _ = trace ("TLSServerParams" :: String)
 
-tlog msg = liftIO $ do
-  tid <- myThreadId
-  putStrLn $ show tid ++ ": "  ++ msg
+instance Traceable TLS.ClientParams where
+  trace _ = trace ("TLSClientParams" :: String)
+
+tlog msg = return ()
+-- tlog msg = liftIO $ do
+--   tid <- myThreadId
+--   putStrLn $ show tid ++ ": "  ++ msg
+--   hFlush stdout
+--   hFlush stderr
 
 -- | Sets up a client TLS context and then initiates a handshake on the socket
 tlsHandshakeClient :: N.Socket -> EndPointAddress -> IO TLS.Context
 tlsHandshakeClient sock clientAddr = do
+  tlsClientParams <- mkTLSClientParams
   clientTLSContext <- TLS.contextNew sock tlsClientParams
   let ourAddrPref = "(" ++ show clientAddr ++ ") "
   let tlsHandshake = do
-        putStrLn $ ourAddrPref ++ "Starting client TLS handshake..."
+        tlog $ ourAddrPref ++ "Starting client TLS handshake..."
         TLS.handshake clientTLSContext
-        putStrLn $ ourAddrPref ++ "Finished client TLS handshake."
+        tlog $ ourAddrPref ++ "Finished client TLS handshake."
   () <- tlsHandshake
   pure clientTLSContext
 
 -- | Sets up a server TLS context and then initiates a handshake on the socket
 tlsHandshakeServer :: N.Socket -> EndPointAddress -> IO TLS.Context
 tlsHandshakeServer sock serverAddr = do
-  eServerParams <- mkServerParams "server_cert.pem" "server_key.pem"
+  eServerParams <- mkTLSServerParams "server_cert.pem" "server_key.pem"
   serverParams <- case eServerParams of
     Left err -> throwIO (userError (show err))
     Right serverParams' -> pure serverParams'
   serverTLSContext <- TLS.contextNew sock serverParams
   let ourAddrPref = "(" ++ "client" ++ ") "
   let tlsHandshake = do
-        putStrLn $ ourAddrPref ++ "Starting server TLS handshake..."
+        tlog $ ourAddrPref ++ "Starting server TLS handshake..."
         TLS.handshake serverTLSContext
-        putStrLn $ ourAddrPref ++ "Finished server TLS handshake."
+        tlog $ ourAddrPref ++ "Finished server TLS handshake."
   () <- tlsHandshake
   pure serverTLSContext
 
@@ -1226,6 +1234,7 @@ testUnreachableConnect = do
 
 main :: IO ()
 main = do
+  hSetBuffering stdout LineBuffering
   tcpResult <- tryIO $ runTests
            [ ("Use random port",        testUseRandomPort)
            , ("EarlyDisconnect",        testEarlyDisconnect)
