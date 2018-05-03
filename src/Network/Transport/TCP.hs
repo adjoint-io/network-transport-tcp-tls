@@ -69,8 +69,6 @@ import Network.Transport.TCP.Internal
   , forkServer
   , recvWithLength
   , recvExact
-  , sendChunks
-  , recvChunks
   , recvWord32
   , encodeWord32
   , tryCloseSocket
@@ -191,7 +189,6 @@ import Data.Accessor (Accessor, accessor, (^.), (^=), (^:))
 import qualified Data.Accessor.Container as DAC (mapMaybe)
 import Data.Foldable (forM_, mapM_)
 import qualified System.Timeout (timeout)
-import qualified System.Directory as D (getCurrentDirectory)
 
 -- $design
 --
@@ -1156,7 +1153,7 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
                 --
                 -- The thread handling incoming messages will detect the socket is
                 -- closed and will report the failure upwards.
-                tryCloseSocket (remoteSocket vst)
+                tryCloseSocketTLS (remoteSocket vst) (remoteTLSContext vst)
                 -- Waiting the probe ack and closing the socket is only needed in
                 -- platforms where TCP_USER_TIMEOUT is not available or when the
                 -- user does not set it. Otherwise the ack would be handled at the
@@ -2044,6 +2041,10 @@ recvTLS (tlsCtx, sock) recvLimit = do
   when (len > recvLimit) $
     throwIO (userError "recvTLS: limit exceeded")
   TLS.recvData tlsCtx
+
+tryCloseSocketTLS :: N.Socket -> TLS.Context -> IO ()
+tryCloseSocketTLS sock ctx =
+  TLS.bye ctx >> tryCloseSocket sock
 
 --------------------------------------------------------------------------------
 -- Scheduling actions                                                         --

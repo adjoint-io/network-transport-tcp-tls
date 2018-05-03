@@ -20,9 +20,6 @@ module Network.Transport.TCP.Internal
   , randomEndPointAddress
   , ProtocolVersion
   , currentProtocolVersion
-
-  , sendChunks
-  , recvChunks
   ) where
 
 #if ! MIN_VERSION_base(4,6,0)
@@ -59,7 +56,7 @@ import qualified Network.Socket as N
   , defaultProtocol
   , setSocketOption
   , accept
-  , sClose
+  , close
   , socketPort
   , shutdown
   , ShutdownCmd(ShutdownBoth)
@@ -248,7 +245,7 @@ forkServer host port backlog reuseAddr errorHandler terminationHandler requestHa
       -- Close up and fill the synchonizing MVar.
       let release :: ((N.Socket, N.SockAddr), MVar ()) -> IO ()
           release ((sock, _), socketClosed) =
-            N.sClose sock `finally` putMVar socketClosed ()
+            N.close sock `finally` putMVar socketClosed ()
 
       -- Run the request handler.
       let act restore (sock, sockAddr) = do
@@ -270,7 +267,7 @@ forkServer host port backlog reuseAddr errorHandler terminationHandler requestHa
             -- Looks like 'act' will never throw an exception, but to be
             -- safe we'll close the socket if it does.
             let handler :: SomeException -> IO ()
-                handler _ = N.sClose sock
+                handler _ = N.close sock
             catch (act restore (sock, sockAddr)) handler
 
       -- We start listening for incoming requests in a separate thread. When
@@ -303,7 +300,7 @@ recvWord32 = fmap (decodeWord32 . BS.concat) . flip recvExact 4
 -- | Close a socket, ignoring I/O exceptions.
 tryCloseSocket :: N.Socket -> IO ()
 tryCloseSocket sock = void . tryIO $
-  N.sClose sock
+  N.close sock
 
 -- | Shutdown socket sends and receives, ignoring I/O exceptions.
 tryShutdownSocketBoth :: N.Socket -> IO ()
@@ -325,23 +322,6 @@ recvExact sock len = go [] len
       bs <- NBS.recv sock (fromIntegral l `min` smallChunkSize)
       if BS.null bs
         then throwIO (userError $ show l ++ ": recvExact: Socket closed")
-        else go (bs : acc) (l - fromIntegral (BS.length bs))
-
-sendChunks :: Int -> N.Socket -> ByteString -> IO ()
-sendChunks chunkSize sock bs = do
-  let chunks = chunksOf chunkSize bs
-  NBS.sendMany sock chunks
-
-recvChunks :: Int -> N.Socket -> Int -> IO ByteString
-recvChunks chunkSize sock nbytes =
-    BS.concat <$> go [] (fromIntegral nbytes)
-  where
-    go :: [ByteString] -> Word32 -> IO [ByteString]
-    go acc 0 = return (reverse acc)
-    go acc l = do
-      bs <- NBS.recv sock (fromIntegral l `min` chunkSize)
-      if BS.null bs
-        then throwIO (userError $ show l ++ ": recvChunks: Socket closed")
         else go (bs : acc) (l - fromIntegral (BS.length bs))
 
 -- | Get the numeric host, resolved host (via getNameInfo), and port from a
@@ -400,10 +380,3 @@ splitMaxFromEnd p = \n -> go [[]] n . reverse
       if p x then go ([] : acc : accs) (n - 1) xs
              else go ((x : acc) : accs) n xs
     go _ _ _ = error "Bug in splitMaxFromEnd"
-
-chunksOf :: Int -> ByteString -> [ByteString]
-chunksOf n bs
-  | BS.null bs = [BS.empty]
-  | otherwise  =
-      let (chunk,rest) = BS.splitAt n bs
-       in chunk : (chunksOf n rest)
