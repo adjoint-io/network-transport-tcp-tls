@@ -38,7 +38,6 @@ module Network.Transport.TCP
   , simpleUnboundedQDisc
   , simpleOnePlaceQDisc
 
-  , mkBackend
   , mkTLSClientParams
   , mkTLSServerParams
 
@@ -570,6 +569,9 @@ data TCPParameters = TCPParameters {
     -- connection. Throwing an exception here will cause the server to
     -- terminate.
   , tcpServerExceptionHandler :: SomeException -> IO ()
+    -- | Enable TLS for Intra-EndPoint communication by specifying the
+    -- configuration for both TLS client and server endpoints.
+  , tcpTLS :: Maybe (TLSServerParams, TLSClientParams)
   }
 
 -- | Internal functionality we expose for unit testing
@@ -1608,9 +1610,9 @@ setupRemoteEndPoint transport (ourEndPoint, theirEndPoint) connTimeout = do
       Right (socketClosedVar, sock, ConnectionRequestAccepted) -> do
         sendLock <- newMVar ()
 
-        -- Establish a client TLS context since this endpoint is the one
-        -- intiating the connection
-        clientParams <- mkTLSClientParams
+        -- Establish a client TLS context with the endpoint since this
+        -- endpoint is the one intiating the connection.
+        clientParams <- mkTLSClientParams theirAddress
         clientTLSContext <- TLS.contextNew sock clientParams
         putStrLn "Starting client handshake with server..."
         tlsHandshake sendLock clientTLSContext
@@ -2185,14 +2187,21 @@ createConnectionId hcid lcid =
 -- TLS Internals
 --------------------------------------------------------------------------------
 
-mkBackend :: N.Socket -> TLS.Backend
-mkBackend sock = TLS.Backend
-  { TLS.backendClose = return ()
-  , TLS.backendFlush = return ()
-  , TLS.backendSend =
-      TLS.backendSend (TLS.getBackend sock)
-  , TLS.backendRecv =
-      TLS.backendRecv (TLS.getBackend sock)
+data TLSParams = TLSParams
+  { tlsSupported    :: Maybe TLS.Supported
+  , tlsServerParams :: TLSServerParams
+  , tlsClientParams :: TLSClientParams
+  , tlsCertificateStore :: FilePath
+  }
+
+data TLSServerParams = TLSServerParams
+  { tlsServerKeyFile  :: FilePath -- ^ FilePath to load the server private key from
+  , tlsServerCertFile :: FilePath -- ^ FilePath to load the server public key TLS certificate from
+  }
+
+data TLSClientParams = TLSClientParams
+  { tlsClientCredentials :: Maybe (FilePath, FilePath)
+    -- ^ FilePath to load the client private key and tls certificate from
   }
 
 -- | Thread safe TLS handshake
@@ -2212,29 +2221,33 @@ mkTLSServerParams certFile keyFile = do
       pure $ Right def
         { TLS.serverSupported = supported
         , TLS.serverShared    = shared
+          -- Enable Ephemeral DH keys (forward secrecy)
         , TLS.serverDHEParams = Just TLS.ffdhe4096
-    --  , TLS.serverHooks     = serverHooks
+        , TLS.serverHooks     = serverHooks
         }
   where
-  {- TODO To be used when client certificates are desired, e.g. for
-      network-access-token implementation on the
-
+    -- Used when validating a client certificate signed by a network access
+    -- token.
     serverHooks :: TLS.ServerHooks
     serverHooks = def
       { TLS.onClientCertificate = \certChain -> do
           fres <- validateDefault mempty def ("Uplink", mempty) certChain
           pure $ case filter (/= SelfSigned) fres of
             []    -> TLS.CertificateUsageAccept
-            (Expired:_)   -> TLS.CertificateUsageReject TLS.CertificateRejectExpired
-            (UnknownCA:_) -> TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
+            (X509.Expired:_)   -> TLS.CertificateUsageReject TLS.CertificateRejectExpired
+            (X509.UnknownCA:_) -> TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
             (reason:_)    -> TLS.CertificateUsageReject (TLS.CertificateRejectOther (show reason))
       }
-  -}
 
-mkTLSClientParams :: IO TLS.ClientParams
-mkTLSClientParams = do
+-- | Make TLS Client Parameters. The server hostname to connect to must be
+-- supplied, and match the Common Name specified on the TLS Certificate used by
+-- the server. In practice, the host name supplied must match the Common Name on
+-- the SSL Certificate provided by the TLS server in which this client will
+-- connect to. This can be accomplished by supplying the 'HostName' argument
+mkTLSClientParams :: EndPointAddress -> IO TLS.ClientParams
+mkTLSClientParams serverEndPointAddr = do
   shared <- mkShared Nothing -- No client credentials
-  pure $ (TLS.defaultParamsClient "Uplink" "")
+  pure $ (TLS.defaultParamsClient serverHostname "")
     { TLS.clientSupported = supported
     , TLS.clientHooks     = clientHooks
     , TLS.clientShared    = shared
@@ -2248,16 +2261,28 @@ mkTLSClientParams = do
         }
       where
         onServerCert = TLS.onServerCertificate def
+        -- For the moment, we ignore self-signed certificate errors, because
+        -- endpoints do not need
         ignoreSelfSigned = filter (/= X509.SelfSigned)
 
-supported :: TLS.Supported
-supported = def
-  { TLS.supportedCiphers = TLS.ciphersuite_default
+    (serverHostname, _, _) =
+      case decodeEndPointAddress serverEndPointAddr of
+        Nothing  -> throwIO (failed . userError $ "Could not parse")
+        Just dec -> return dec
+
+-- | The default TLS parameters supported by endpoints. Parameters can contain
+-- only a single value because each endpoint using network-transport will
+-- "probably" be communicating with other Transport EndPoints. In the case that
+-- network-transport EndPoints will be communicating with other network
+-- entities, override these defaults with a wider range of options.
+defaultSupported :: TLS.Supported
+defaultSupported = def
+  { TLS.supportedCiphers  = [cipher_ECDHE_ECDSA_AES256GCM_SHA384]
   , TLS.supportedVersions = [TLS.TLS12]
   , TLS.supportedGroups   = [TLS.X25519]
   }
 
--- Load Server or Client credentials
+-- Load TLS Server or TLS Client credentials
 loadCredentials :: FilePath -> FilePath -> IO (Either IOException TLS.Credentials)
 loadCredentials certFile keyFile = do
   eCred <- TLS.credentialLoadX509 certFile keyFile
@@ -2265,15 +2290,18 @@ loadCredentials certFile keyFile = do
     Left err   -> Left $ userError $ "Failed to load server credentials: " ++ err
     Right cred -> Right $ TLS.Credentials [cred]
 
-mkShared :: Maybe TLS.Credentials -> IO TLS.Shared
-mkShared mCreds = do
-  mCertStore <- X509.readCertificateStore "/etc/ssl/certs"
+-- | Must provide credentials if making a 'Shared' value for a TLS server
+-- TODO Figure out if client credentials are ever necessary
+mkShared :: Maybe FilePath -> Maybe TLS.Credentials -> IO TLS.Shared
+mkShared mCAStore mCreds = do
+  mCertStore <-
+    case mCAStore of
+      Nothing -> pure Nothing
+      Just caStore -> X509.readCertificateStore caStore
   pure def
-    { TLS.sharedCredentials = creds
+    { TLS.sharedCredentials = fromMaybe mempty mCreds
     , TLS.sharedCAStore = fromMaybe mempty mCertStore
     }
-  where
-    creds = fromMaybe mempty mCreds
 
 --------------------------------------------------------------------------------
 -- Functions from TransportInternals                                          --
