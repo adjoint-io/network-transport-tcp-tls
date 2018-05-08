@@ -54,6 +54,7 @@ module Network.Transport.TCP
   , TLS.handshake
   , sendTLS'
   , recvTLS
+  , addLoggingHooks
 
     -- * Design notes
     -- $design
@@ -173,7 +174,7 @@ import Control.Exception
   )
 import Data.IORef (IORef, newIORef, writeIORef, readIORef, writeIORef)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS (concat, length, null, empty, splitAt, cons)
+import qualified Data.ByteString as BS (concat, append, length, null, empty, splitAt, cons)
 import qualified Data.ByteString.Char8 as BSC (pack, unpack)
 import qualified Data.ByteString.Lazy as BSL
 import Data.Bits (shiftL, (.|.))
@@ -590,7 +591,8 @@ data TCPParameters = TCPParameters {
     -- that the client can verify the CommonName of the TLS Certificate the
     -- server responds with. The hostname of the endpoint address must match the
     -- Common Name of the Certificate provided by the server.
-  , tcpTLSClientParams :: EndPointAddress -> IO TLS.ClientParams
+  , tcpTLSClientParams :: EndPointAddress
+                       -> IO (Either (TransportError ConnectErrorCode) TLS.ClientParams)
   }
 
 -- | Internal functionality we expose for unit testing
@@ -720,7 +722,7 @@ defaultTCPParameters TLSConfig{..} = TCPParameters
   , tcpCheckPeerHost   = False
   , tcpServerExceptionHandler = throwIO
   , tcpTLSServerParams =
-    mkTLSServerParams tlsSupported (mkShared tlsCertificateStore (Just tlsServerCredentials))
+      mkTLSServerParams tlsSupported (mkShared tlsCertificateStore (Just tlsServerCredentials))
   , tcpTLSClientParams =
       mkTLSClientParams tlsSupported (mkShared tlsCertificateStore tlsClientCredentials)
   }
@@ -1115,8 +1117,8 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
 
       go :: LocalEndPoint -> EndPointAddress -> IO ()
       go ourEndPoint theirAddress = handle handleException $ do
-
         resetIfBroken ourEndPoint theirAddress
+
         (theirEndPoint, isNew) <-
           findRemoteEndPoint ourEndPoint theirAddress RequestedByThem Nothing
 
@@ -1144,17 +1146,16 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
                         , _remoteLastIncoming  = 0
                         , _remoteNextConnOutId = firstNonReservedLightweightConnectionId
                         }
+
             sendMany sock [encodeWord32 (encodeConnectionRequestResponse ConnectionRequestAccepted)]
 
             remoteEndPointState <- do
               -- Perform the TLS handshake on the remote endpoint's socket,
               -- catching exceptions that might occur
               eHandshakeRes <-
-                handle handleTLSHandshakeFail $
+                handle handleTLSHandshakeFail $ do
+                  -- TLS.contextModifyHooks serverTLSContext (addLoggingHooks "Server")
                   Right <$> tlsHandshake sendLock serverTLSContext
-              print "-------------------"
-              print eHandshakeRes
-              print "-------------------"
               pure $ case eHandshakeRes of
                 Left err -> RemoteEndPointInvalid err
                 Right () -> RemoteEndPointValid vst
@@ -1642,12 +1643,15 @@ setupRemoteEndPoint transport (ourEndPoint, theirEndPoint) connTimeout = do
         -- Establish a client TLS context with the endpoint since this
         -- endpoint is the one intiating the connection.
         eClientTLSContext <- do
-          handle handleTLSHandshakeFail $ do
-            tlsClientParams <- tcpTLSClientParams (transportParams transport) theirAddress
-            clientTLSContext <- TLS.contextNew sock tlsClientParams
-            -- Perform TLS handshake with server before setting up remote ep state
-            tlsHandshake sendLock clientTLSContext
-            pure $ Right clientTLSContext
+          eTlsClientParams <- tcpTLSClientParams (transportParams transport) theirAddress
+          case eTlsClientParams of
+            Left err -> pure (Left err)
+            Right tlsClientParams -> do
+              -- Perform TLS handshake with server before setting up remote ep state
+              clientTLSContext <- TLS.contextNew sock tlsClientParams
+              -- TLS.contextModifyHooks clientTLSContext (addLoggingHooks "Client")
+              tlsHandshake sendLock clientTLSContext
+              pure $ Right clientTLSContext
 
         case eClientTLSContext of
           -- In the case that the TLS handshake failed, throw the exception and
@@ -2050,6 +2054,8 @@ sendOn vst bs = withMVar (remoteSendLock vst) $ \() ->
 -- This function is thread safe as it uses the send lock of the endpoint, and
 -- will send the message without risk of the connection id and following
 -- message getting interleaved with messages sent by other threads.
+--
+-- This function may throw a 'TransportError SendFailed' exception.
 sendOnWithTLS
   :: ValidRemoteEndPointState
   -> LightweightConnectionId
@@ -2310,10 +2316,10 @@ mkTLSConfig supported (serverCert,serverKey) mCertStoreFp mClientCredsFp = do
 
 -- | Thread safe TLS handshake
 tlsHandshake :: MVar () -> TLS.Context -> IO ()
-tlsHandshake sendLock tlsCtx =
+tlsHandshake sendLock tlsCtx = do
   withMVar sendLock $ \() ->
-    catch (TLS.handshake tlsCtx) $ \(e :: SomeException) ->
-      throwIO (userError (show e))
+    tlsErrToTransportErr (TransportError ConnectFailed . show) $
+      TLS.handshake tlsCtx
 
 -- | Creates TLS Server Parameters. The Common name supplied to this function
 -- should match the common name on the client certificate, if using a
@@ -2328,10 +2334,12 @@ mkTLSServerParams
   -> IO TLS.ServerParams
 mkTLSServerParams supported serverShared mClientAddr = do
     mClientHostname <-
-      case decodeEndPointAddress <$> mClientAddr of
-        Nothing                            -> throwIO decodeFailure
-        Just Nothing                       -> pure Nothing
-        Just (Just (clientHostname, _, _)) -> return $ Just clientHostname
+      case mClientAddr of
+        Nothing -> pure Nothing
+        Just caddr ->
+          case decodeEndPointAddress caddr of
+            Nothing                     -> throwIO decodeFailure
+            Just (clientHostname, _, _) -> return $ Just clientHostname
     pure def
       { TLS.serverSupported = supported
       , TLS.serverShared    = serverShared
@@ -2367,17 +2375,16 @@ mkTLSClientParams
   :: TLS.Supported    -- ^ Supported TLS parameters like cipher suite, TLS version, etc.
   -> TLS.Shared       -- ^ Parameters shared with Server to prove identity
   -> EndPointAddress  -- ^ Endpoint address with which to connect.
-  -> IO TLS.ClientParams
+  -> IO (Either (TransportError ConnectErrorCode) TLS.ClientParams)
 mkTLSClientParams supported shared serverEndPointAddr = do
-  serverHostname <-
-    case decodeEndPointAddress serverEndPointAddr of
-      Nothing  -> throwIO decodeFailure
-      Just (serverHostname, _, _) -> return serverHostname
-  pure $ (TLS.defaultParamsClient serverHostname "")
-    { TLS.clientSupported = supported
-    , TLS.clientHooks     = clientHooks
-    , TLS.clientShared    = shared
-    }
+  case decodeEndPointAddress serverEndPointAddr of
+    Nothing  -> pure (Left decodeFailure)
+    Just (serverHostname, _, _) -> do
+      pure $ Right $ (TLS.defaultParamsClient serverHostname "")
+        { TLS.clientSupported = supported
+        , TLS.clientHooks     = clientHooks
+        , TLS.clientShared    = shared
+        }
   where
     clientHooks :: TLS.ClientHooks
     clientHooks = def
@@ -2402,9 +2409,9 @@ mkTLSClientParams supported shared serverEndPointAddr = do
 -- entities, override these defaults with a wider range of options.
 defaultSupported :: TLS.Supported
 defaultSupported = def
-  { TLS.supportedCiphers  = [TLS.cipher_ECDHE_ECDSA_AES256GCM_SHA384]
+  { TLS.supportedCiphers  = TLS.ciphersuite_dhe_rsa
   , TLS.supportedVersions = [TLS.TLS12]
-  , TLS.supportedGroups   = [TLS.X25519]
+  , TLS.supportedGroups   = [TLS.FFDHE4096] -- FFDHE4096 necessary when server using DH ephermeral RSA
   }
 
 -- | Load TLS Server or Client credentials
@@ -2424,6 +2431,17 @@ mkShared mCAStore mCreds = def
   { TLS.sharedCredentials = fromMaybe mempty mCreds
   , TLS.sharedCAStore = fromMaybe mempty mCAStore
   }
+
+addLoggingHooks :: [Char] -> TLS.Hooks -> TLS.Hooks
+addLoggingHooks pref hooks =
+  hooks { TLS.hookLogging = logging }
+  where
+    logging = TLS.Logging
+      { TLS.loggingPacketSent = print . (++) ("(" ++ pref ++ ") " ++ "PacketSent: ")
+      , TLS.loggingPacketRecv = print . (++) ("(" ++ pref ++ ") " ++ "PacketRecv: ")
+      , TLS.loggingIOSent = \_ -> pure ()
+      , TLS.loggingIORecv = \_ _ -> pure ()
+      }
 
 -- | Turn a TLSError into a TransportError
 tlsErrToTransportErr

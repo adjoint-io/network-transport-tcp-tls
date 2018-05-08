@@ -36,6 +36,7 @@ import Network.Transport.TCP ( createTransport
                              , handshake
                              , recvTLS
                              , sendTLS'
+                             , addLoggingHooks
                              )
 import Control.Concurrent (threadDelay, killThread, myThreadId)
 import Control.Concurrent.MVar ( MVar
@@ -104,7 +105,7 @@ import Network.Socket.ByteString (sendMany)
 
 import Control.Monad.IO.Class (MonadIO, liftIO)
 
-import qualified Data.ByteString as BS (ByteString, length, concat)
+import qualified Data.ByteString as BS (ByteString, append, length, concat)
 import Data.String (fromString)
 import GHC.IO.Exception (ioe_errno)
 import Foreign.C.Error (Errno(..), eADDRNOTAVAIL)
@@ -161,10 +162,11 @@ testTCPParametersTLS = do
     mkTLSConfig defaultSupported ("tests/server_cert.pem", "tests/server_key.pem") Nothing Nothing
   pure $ defaultTCPParameters testTLSConfig
 
--- | The endpoint a
 testTLSClientParams :: EndPointAddress -> IO TLS.ClientParams
-testTLSClientParams =
-  mkTLSClientParams defaultSupported (mkShared Nothing Nothing)
+testTLSClientParams epAddr = do
+  Right tlsClientParams <-
+    mkTLSClientParams defaultSupported (mkShared Nothing Nothing) epAddr
+  pure tlsClientParams
 
 testTLSServerParams :: IO TLS.ServerParams
 testTLSServerParams = do
@@ -178,6 +180,7 @@ tlsHandshakeClient clientParams sock clientAddr = do
   let ourAddrPref = "(" ++ show clientAddr ++ ") "
   let tlsHandshake = do
         tlog $ ourAddrPref ++ "Starting client TLS handshake..."
+        TLS.contextModifyHooks clientTLSContext (addLoggingHooks "T-CLIENT")
         TLS.handshake clientTLSContext
         tlog $ ourAddrPref ++ "Finished client TLS handshake."
   () <- tlsHandshake
@@ -190,6 +193,7 @@ tlsHandshakeServer serverParams sock serverAddr = do
   let ourAddrPref = "(" ++ "client" ++ ") "
   let tlsHandshake = do
         tlog $ ourAddrPref ++ "Starting server TLS handshake..."
+        TLS.contextModifyHooks serverTLSContext (addLoggingHooks "T-SERVER")
         TLS.handshake serverTLSContext
         tlog $ ourAddrPref ++ "Finished server TLS handshake."
   () <- tlsHandshake
@@ -1042,13 +1046,20 @@ testUseRandomPort :: IO ()
 testUseRandomPort = do
    testDone <- newEmptyMVar
    forkTry $ do
+     putStrLn "11111"
      Right transport1 <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
+     putStrLn "22222"
      Right ep1        <- newEndPoint transport1
+     putStrLn "33333"
      -- Same as transport1, but is strict in the port.
      Right transport2 <- createTransport (Addressable (TCPAddrInfo "127.0.0.1" "0" (\(!port) -> ("127.0.0.1", port)))) =<< testTCPParametersTLS
+     putStrLn "44444"
      Right ep2        <- newEndPoint transport2
+     putStrLn "55555"
      Right conn1 <- connect ep2 (address ep1) ReliableOrdered defaultConnectHints
+     putStrLn "66666"
      ConnectionOpened _ _ _ <- receive ep1
+     putStrLn "77777"
      putMVar testDone ()
    takeMVar testDone
 
