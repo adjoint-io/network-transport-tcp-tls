@@ -25,9 +25,14 @@ import Network.Transport.TCP ( createTransport
                              , TCPAddrInfo(..)
                              , TCPAddr(..)
                              , defaultTCPAddr
-                             , mkBackend
+
+                             , TLSConfig
+                             , mkTLSConfig
                              , mkTLSClientParams
                              , mkTLSServerParams
+                             , defaultSupported
+                             , mkShared
+                             , loadCredentials
                              , handshake
                              , recvTLS
                              , sendTLS'
@@ -46,7 +51,7 @@ import Control.Concurrent.MVar ( MVar
                                )
 import Control.Monad (replicateM, guard, forM_, replicateM_, when)
 import Control.Applicative ((<$>))
-import Control.Exception (throwIO, try, SomeException, catch)
+import Control.Exception (throwIO, try, SomeException, catch, IOException)
 import Network.Transport.TCP ( socketToEndPoint )
 import Network.Transport.Internal ( prependLength
                                   , tryIO
@@ -126,26 +131,50 @@ instance Traceable TransportInternals where
   trace = const Nothing
 
 instance Traceable TLS.Context where
-  trace _ = trace ("TLSContext" :: String)
+  trace _ = trace ("TLS.Context" :: String)
 
 instance Traceable TLS.ServerParams where
-  trace _ = trace ("TLSServerParams" :: String)
+  trace _ = trace ("TLS.ServerParams" :: String)
 
 instance Traceable TLS.ClientParams where
-  trace _ = trace ("TLSClientParams" :: String)
+  trace _ = trace ("TLS.ClientParams" :: String)
 
-tlog msg = return ()
--- tlog msg = liftIO $ do
---   tid <- myThreadId
---   putStrLn $ show tid ++ ": "  ++ msg
---   hFlush stdout
---   hFlush stderr
+instance Traceable TLSConfig where
+  trace _ = trace ("TLSConfig" :: String)
+
+instance Traceable TLS.Credentials where
+  trace _ = trace ("TLS.Credentials" :: String)
+
+instance Traceable TCPParameters where
+  trace _ = trace ("TCPParameters" :: String)
+
+-- tlog msg = return ()
+tlog msg = liftIO $ do
+  tid <- myThreadId
+  putStrLn $ show tid ++ ": "  ++ msg
+  hFlush stdout
+  hFlush stderr
+
+testTCPParametersTLS :: IO TCPParameters
+testTCPParametersTLS = do
+  Right testTLSConfig <-
+    mkTLSConfig defaultSupported ("tests/server_cert.pem", "tests/server_key.pem") Nothing Nothing
+  pure $ defaultTCPParameters testTLSConfig
+
+-- | The endpoint a
+testTLSClientParams :: EndPointAddress -> IO TLS.ClientParams
+testTLSClientParams =
+  mkTLSClientParams defaultSupported (mkShared Nothing Nothing)
+
+testTLSServerParams :: IO TLS.ServerParams
+testTLSServerParams = do
+  Right serverCreds <- loadCredentials "tests/server_cert.pem" "tests/server_key.pem"
+  mkTLSServerParams defaultSupported (mkShared Nothing (Just serverCreds)) Nothing
 
 -- | Sets up a client TLS context and then initiates a handshake on the socket
-tlsHandshakeClient :: N.Socket -> EndPointAddress -> IO TLS.Context
-tlsHandshakeClient sock clientAddr = do
-  tlsClientParams <- mkTLSClientParams
-  clientTLSContext <- TLS.contextNew sock tlsClientParams
+tlsHandshakeClient :: TLS.ClientParams -> N.Socket -> EndPointAddress -> IO TLS.Context
+tlsHandshakeClient clientParams sock clientAddr = do
+  clientTLSContext <- TLS.contextNew sock clientParams
   let ourAddrPref = "(" ++ show clientAddr ++ ") "
   let tlsHandshake = do
         tlog $ ourAddrPref ++ "Starting client TLS handshake..."
@@ -155,12 +184,8 @@ tlsHandshakeClient sock clientAddr = do
   pure clientTLSContext
 
 -- | Sets up a server TLS context and then initiates a handshake on the socket
-tlsHandshakeServer :: N.Socket -> EndPointAddress -> IO TLS.Context
-tlsHandshakeServer sock serverAddr = do
-  eServerParams <- mkTLSServerParams "server_cert.pem" "server_key.pem"
-  serverParams <- case eServerParams of
-    Left err -> throwIO (userError (show err))
-    Right serverParams' -> pure serverParams'
+tlsHandshakeServer :: TLS.ServerParams -> N.Socket -> EndPointAddress -> IO TLS.Context
+tlsHandshakeServer serverParams sock serverAddr = do
   serverTLSContext <- TLS.contextNew sock serverParams
   let ourAddrPref = "(" ++ "client" ++ ") "
   let tlsHandshake = do
@@ -187,7 +212,7 @@ testEarlyDisconnect = do
     server :: MVar EndPointAddress -> MVar EndPointAddress -> MVar () -> IO ()
     server serverAddr clientAddr serverDone = do
       tlog "Server"
-      Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+      Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
       Right endpoint  <- newEndPoint transport
       putMVar serverAddr (address endpoint)
       theirAddr <- readMVar clientAddr
@@ -254,7 +279,8 @@ testEarlyDisconnect = do
         -- Initiate the server TLS handshake on connection receipt
         port <- show <$> N.socketPort sock
         let ourAddress = encodeEndPointAddress "127.0.0.1" port 1
-        tlsCtxt <- tlsHandshakeServer sock ourAddress
+        tlsCtxt <- testTLSServerParams >>= \serverParams ->
+          tlsHandshakeServer serverParams sock ourAddress
 
         tlog "Client: Server opens a logical connection, recvs CreatedNewConnection"
         Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
@@ -283,13 +309,14 @@ testEarlyDisconnect = do
       putMVar clientAddr ourAddress
 
       tlog "Client: Connect to the server"
+      serverAddress <- readMVar serverAddr
       Right (_, sock, ConnectionRequestAccepted) <-
-        readMVar serverAddr >>= \addr ->
-          socketToEndPoint (Just ourAddress) addr True False False Nothing Nothing
+        socketToEndPoint (Just ourAddress) serverAddress True False False Nothing Nothing
 
       -- Establish a client TLS context since this endpoint is the one
       -- intiating the connection
-      ctxt <- tlsHandshakeClient sock ourAddress
+      tlsClientParams <- testTLSClientParams serverAddress
+      ctxt <- tlsHandshakeClient tlsClientParams sock ourAddress
 
       tlog "Client: Open a new connection"
       sendMany sock [
@@ -317,7 +344,7 @@ testEarlyCloseSocket = do
     server :: MVar EndPointAddress -> MVar EndPointAddress -> MVar () -> IO ()
     server serverAddr clientAddr serverDone = do
       tlog "Server"
-      Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+      Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
       Right endpoint  <- newEndPoint transport
       putMVar serverAddr (address endpoint)
       theirAddr <- readMVar clientAddr
@@ -383,7 +410,8 @@ testEarlyCloseSocket = do
         -- Initiate the server TLS handshake on connection receipt
         port <- show <$> N.socketPort sock
         let ourAddress = encodeEndPointAddress "127.0.0.1" port 1
-        tlsCtxt <- tlsHandshakeServer sock ourAddress
+        tlsServerParams <- testTLSServerParams
+        tlsCtxt <- tlsHandshakeServer tlsServerParams  sock ourAddress
 
         -- Server opens a logical connection
         Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
@@ -416,13 +444,14 @@ testEarlyCloseSocket = do
       putMVar clientAddr ourAddress
 
       -- Connect to the server
+      serverAddress <- readMVar serverAddr
       Right (_, sock, ConnectionRequestAccepted) <-
-        readMVar serverAddr >>= \addr ->
-          socketToEndPoint (Just ourAddress) addr True False False Nothing Nothing
+        socketToEndPoint (Just ourAddress) serverAddress True False False Nothing Nothing
 
       -- Establish a client TLS context since this endpoint is the one
       -- intiating the connection
-      ctxt <- tlsHandshakeClient sock ourAddress
+      tlsClientParams <- testTLSClientParams serverAddress
+      tlsCtx <- tlsHandshakeClient tlsClientParams sock ourAddress
 
       -- Open a new connection
       sendMany sock [
@@ -441,13 +470,13 @@ testEarlyCloseSocket = do
 -- | Test the creation of a transport with an invalid address
 testInvalidAddress :: IO ()
 testInvalidAddress = do
-  Left _ <- createTransport (defaultTCPAddr "invalidHostName" "0") defaultTCPParameters
+  Left _ <- createTransport (defaultTCPAddr "invalidHostName" "0") =<< testTCPParametersTLS
   return ()
 
 -- | Test connecting to invalid or non-existing endpoints
 testInvalidConnect :: IO ()
 testInvalidConnect = do
-  Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+  Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
   Right endpoint  <- newEndPoint transport
 
   -- Syntax error in the endpoint address
@@ -478,7 +507,7 @@ testIgnoreCloseSocket = do
   clientDone <- newEmptyMVar
   serverDone <- newEmptyMVar
   connectionEstablished <- newEmptyMVar
-  Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+  Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
 
   -- Server
   forkTry $ do
@@ -521,7 +550,8 @@ testIgnoreCloseSocket = do
     putMVar connectionEstablished ()
 
     -- Initiate a TLS handshake with the server
-    tlsCtx <- tlsHandshakeClient sock ourAddress
+    tlsClientParams <- testTLSClientParams theirAddress
+    tlsCtx <- tlsHandshakeClient tlsClientParams sock ourAddress
 
     -- Server connects to us, and then closes the connection
     Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
@@ -572,7 +602,7 @@ testBlockAfterCloseSocket = do
   clientDone <- newEmptyMVar
   serverDone <- newEmptyMVar
   connectionEstablished <- newEmptyMVar
-  Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+  Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
 
   -- Server
   forkTry $ do
@@ -610,7 +640,8 @@ testBlockAfterCloseSocket = do
     putMVar connectionEstablished ()
 
     -- Initiate a TLS handshake with the client
-    tlsCtx <- tlsHandshakeClient sock ourAddress
+    tlsClientParams <- testTLSClientParams theirAddress
+    tlsCtx <- tlsHandshakeClient tlsClientParams sock ourAddress
 
     -- Server connects to us, and then closes the connection
     Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
@@ -655,7 +686,7 @@ testUnnecessaryConnect numThreads = do
   serverAddr <- newEmptyMVar
 
   forkTry $ do
-    Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+    Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
     Right endpoint <- newEndPoint transport
     -- Since we're lying about the server's address, we have to manually
     -- construct the proper address. If we used its actual address, the clients
@@ -699,11 +730,11 @@ testUnnecessaryConnect numThreads = do
 -- | Test that we can create "many" transport instances
 testMany :: IO ()
 testMany = do
-  Right masterTransport <- createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+  Right masterTransport <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
   Right masterEndPoint  <- newEndPoint masterTransport
 
   replicateM_ 10 $ do
-    mTransport <- createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+    mTransport <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
     case mTransport of
       Left ex -> do
         putStrLn $ "IOException: " ++ show ex ++ "; errno = " ++ show (ioe_errno ex)
@@ -720,7 +751,7 @@ testMany = do
 -- | Test what happens when the transport breaks completely
 testBreakTransport :: IO ()
 testBreakTransport = do
-  Right (transport, internals) <- createTransportExposeInternals (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+  Right (transport, internals) <- createTransportExposeInternals (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
   Right endpoint <- newEndPoint transport
 
   let Just tid = transportThread internals
@@ -779,7 +810,8 @@ testReconnect = do
       -- Initiate the server TLS handshake on connection receipt
       port <- show <$> N.socketPort sock
       let ourAddress = encodeEndPointAddress "127.0.0.1" port 1
-      tlsCtxt <- tlsHandshakeServer sock ourAddress
+      tlsServerParams <- testTLSServerParams
+      tlsCtxt <- tlsHandshakeServer tlsServerParams sock ourAddress
 
       -- Client requests a logical connection
       when (count > 1) $ do
@@ -803,7 +835,7 @@ testReconnect = do
 
   -- Client
   forkTry $ do
-    Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+    Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
     Right endpoint  <- newEndPoint transport
     let theirAddr = encodeEndPointAddress "127.0.0.1" serverPort 0
 
@@ -896,7 +928,8 @@ testUnidirectionalError = do
       -- Initiate the server TLS handshake on connection receipt
       port <- show <$> N.socketPort sock
       let ourAddress = encodeEndPointAddress "127.0.0.1" port 1
-      tlsCtxt <- tlsHandshakeServer sock ourAddress
+      tlsServerParams <- testTLSServerParams
+      tlsCtxt <- tlsHandshakeServer tlsServerParams sock ourAddress
 
       Just CreatedNewConnection <- decodeControlHeader <$> recvWord32 sock
       connId <- recvWord32 sock :: IO LightweightConnectionId
@@ -912,7 +945,7 @@ testUnidirectionalError = do
 
   -- Client
   forkTry $ do
-    Right (transport, internals) <- createTransportExposeInternals (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+    Right (transport, internals) <- createTransportExposeInternals (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
     Right endpoint <- newEndPoint transport
     let theirAddr = encodeEndPointAddress "127.0.0.1" serverPort 0
 
@@ -967,7 +1000,7 @@ testUnidirectionalError = do
 
 testInvalidCloseConnection :: IO ()
 testInvalidCloseConnection = do
-  Right (transport, internals) <- createTransportExposeInternals (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+  Right (transport, internals) <- createTransportExposeInternals (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
   serverAddr <- newEmptyMVar
   clientDone <- newEmptyMVar
   serverDone <- newEmptyMVar
@@ -1009,10 +1042,10 @@ testUseRandomPort :: IO ()
 testUseRandomPort = do
    testDone <- newEmptyMVar
    forkTry $ do
-     Right transport1 <- createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+     Right transport1 <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
      Right ep1        <- newEndPoint transport1
      -- Same as transport1, but is strict in the port.
-     Right transport2 <- createTransport (Addressable (TCPAddrInfo "127.0.0.1" "0" (\(!port) -> ("127.0.0.1", port)))) defaultTCPParameters
+     Right transport2 <- createTransport (Addressable (TCPAddrInfo "127.0.0.1" "0" (\(!port) -> ("127.0.0.1", port)))) =<< testTCPParametersTLS
      Right ep2        <- newEndPoint transport2
      Right conn1 <- connect ep2 (address ep1) ReliableOrdered defaultConnectHints
      ConnectionOpened _ _ _ <- receive ep1
@@ -1025,7 +1058,9 @@ testUseRandomPort = do
 testMaxLength :: IO ()
 testMaxLength = do
 
-  Right serverTransport <- createTransport (defaultTCPAddr "127.0.0.1" "9998") $ defaultTCPParameters {
+  Right serverTransport <- do
+    tcpTlsParams <- testTCPParametersTLS
+    createTransport (defaultTCPAddr "127.0.0.1" "9998") $ tcpTlsParams {
       -- 17 bytes should fit every valid address at 127.0.0.1.
       -- Port is at most 5 bytes (65536) and id is a base-10 Word32 so
       -- at most 10 bytes. We'll have one client with a 5-byte port to push it
@@ -1033,8 +1068,10 @@ testMaxLength = do
       tcpMaxAddressLength = 16
     , tcpMaxReceiveLength = 8
     }
-  Right goodClientTransport <- createTransport (defaultTCPAddr "127.0.0.1" "9999") defaultTCPParameters
-  Right badClientTransport <- createTransport (defaultTCPAddr "127.0.0.1" "10000") defaultTCPParameters
+
+  tcpTlsParams <- testTCPParametersTLS
+  Right goodClientTransport <- createTransport (defaultTCPAddr "127.0.0.1" "9999") tcpTlsParams
+  Right badClientTransport <- createTransport (defaultTCPAddr "127.0.0.1" "10000") tcpTlsParams
 
   serverAddress <- newEmptyMVar
   testDone <- newEmptyMVar
@@ -1097,7 +1134,7 @@ testCloseEndPoint = do
   -- A server which accepts one connection and then attempts to close the
   -- end point.
   forkTry $ do
-    Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
+    Right transport <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
     Right ep <- newEndPoint transport
     putMVar serverAddress (address ep)
     ConnectionOpened _ _ _ <- receive ep
@@ -1107,7 +1144,8 @@ testCloseEndPoint = do
 
   -- A nefarious client which connects to the server then stops responding.
   forkTry $ do
-    Just (hostName, serviceName, endPointId) <- decodeEndPointAddress <$> readMVar serverAddress
+    serverAddr <- readMVar serverAddress
+    let Just (hostName, serviceName, endPointId) = decodeEndPointAddress serverAddr
     addr:_ <- N.getAddrInfo (Just N.defaultHints) (Just hostName) (Just serviceName)
     sock <- N.socket (N.addrFamily addr) N.Stream N.defaultProtocol
     N.connect sock (N.addrAddress addr)
@@ -1131,7 +1169,8 @@ testCloseEndPoint = do
     Just ConnectionRequestAccepted <- decodeConnectionRequestResponse <$> recvWord32 sock
 
     -- Initiate client TLS handshake
-    tlsCtx <- tlsHandshakeClient sock (encodeEndPointAddress "127.0.0.1" "0" 0)
+    tlsClientParams <- testTLSClientParams serverAddr
+    tlsCtx <- tlsHandshakeClient tlsClientParams sock (encodeEndPointAddress "127.0.0.1" "0" 0)
 
     sendMany sock
       [ -- Create a lightweight connection.
@@ -1149,11 +1188,12 @@ testCloseEndPoint = do
 testCheckPeerHostReject :: IO ()
 testCheckPeerHostReject = do
 
-  let params = defaultTCPParameters { tcpCheckPeerHost = True }
+  tlsParams <- testTCPParametersTLS
+  let params = tlsParams { tcpCheckPeerHost = True }
   Right transport1 <- createTransport (defaultTCPAddr "127.0.0.1" "0") params
   -- This transport claims 127.0.0.2 as its host, but connections from it to
   -- an EndPoint on transport1 will show 127.0.0.1 as the socket's source host.
-  Right transport2 <- createTransport (Addressable (TCPAddrInfo "127.0.0.1" "0" ((,) "127.0.0.2"))) defaultTCPParameters
+  Right transport2 <- createTransport (Addressable (TCPAddrInfo "127.0.0.1" "0" ((,) "127.0.0.2"))) =<< testTCPParametersTLS
 
   Right ep1 <- newEndPoint transport1
   Right ep2 <- newEndPoint transport2
@@ -1170,10 +1210,11 @@ testCheckPeerHostReject = do
 testCheckPeerHostResolve :: IO ()
 testCheckPeerHostResolve = do
 
-  let params = defaultTCPParameters { tcpCheckPeerHost = True }
+  tlsParams <- testTCPParametersTLS
+  let params = tlsParams { tcpCheckPeerHost = True }
   Right transport1 <- createTransport (defaultTCPAddr "127.0.0.1" "0") params
   -- EndPoints on this transport have addresses with "localhost" host part.
-  Right transport2 <- createTransport (Addressable (TCPAddrInfo "127.0.0.1" "0" ((,) "localhost"))) defaultTCPParameters
+  Right transport2 <- createTransport (Addressable (TCPAddrInfo "127.0.0.1" "0" ((,) "localhost"))) tlsParams
 
   Right ep1 <- newEndPoint transport1
   Right ep2 <- newEndPoint transport2
@@ -1188,7 +1229,7 @@ testCheckPeerHostResolve = do
 -- to itself.
 testUnreachableSelfConnect :: IO ()
 testUnreachableSelfConnect = do
-  Right transport <- createTransport Unaddressable defaultTCPParameters
+  Right transport <- createTransport Unaddressable =<< testTCPParametersTLS
   Right ep <- newEndPoint transport
   Right conn <- connect ep (address ep) ReliableOrdered defaultConnectHints
   ConnectionOpened connid ReliableOrdered _ <- receive ep
@@ -1208,8 +1249,8 @@ testUnreachableSelfConnect = do
 --    at least one lightweight connection open between the two.
 testUnreachableConnect :: IO ()
 testUnreachableConnect = do
-  Right rtransport <- createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters
-  Right utransport <- createTransport Unaddressable defaultTCPParameters
+  Right rtransport <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
+  Right utransport <- createTransport Unaddressable =<< testTCPParametersTLS
   Right rep <- newEndPoint rtransport
   Right uep <- newEndPoint utransport
   -- Reachable endpoint connects to the unreachable endpoint, but it fails.
@@ -1257,8 +1298,9 @@ main = do
            , ("UnreachableConnect",     testUnreachableConnect)
            ]
   -- Run the generic tests even if the TCP specific tests failed..
+  tcpTLSParams <- testTCPParametersTLS
   testTransport (either (Left . show) (Right) <$>
-    createTransport (defaultTCPAddr "127.0.0.1" "0") defaultTCPParameters)
+    createTransport (defaultTCPAddr "127.0.0.1" "0") tcpTLSParams)
   -- ..but if the generic tests pass, still fail if the specific tests did not
   case tcpResult of
     Left err -> throwIO err

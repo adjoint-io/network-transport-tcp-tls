@@ -15,6 +15,7 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module Network.Transport.TCP
   ( -- * Main API
@@ -38,15 +39,23 @@ module Network.Transport.TCP
   , simpleUnboundedQDisc
   , simpleOnePlaceQDisc
 
-  , mkTLSClientParams
-  , mkTLSServerParams
-
     -- * TLS utils
+  , TLSConfig
+  , mkTLSConfig
+  , TLS.ServerParams
+  , mkTLSServerParams
+  , TLS.ClientParams
+  , mkTLSClientParams
+  , TLS.Supported
+  , defaultSupported
+  , TLS.Shared
+  , mkShared
+  , loadCredentials
   , TLS.handshake
-  , sendTLS
   , sendTLS'
   , recvTLS
-  -- * Design notes
+
+    -- * Design notes
     -- $design
   ) where
 
@@ -187,6 +196,7 @@ import Data.Traversable (traverse)
 import Data.Accessor (Accessor, accessor, (^.), (^=), (^:))
 import qualified Data.Accessor.Container as DAC (mapMaybe)
 import Data.Foldable (forM_, mapM_)
+import Data.Typeable (Typeable)
 import qualified System.Timeout (timeout)
 
 -- $design
@@ -470,7 +480,7 @@ data ValidRemoteEndPointState = ValidRemoteEndPointState
   , _remoteNextConnOutId :: !LightweightConnectionId
   ,  remoteSocket        :: !N.Socket
      -- | A TLS Context for establishing secure data transmission over the TCP
-     -- connection between two endpoints
+     -- connection between two endpoints.
   ,  remoteTLSContext    :: TLS.Context
      -- | When the connection is being probed, yields an IO action that can be
      -- used to release any resources dedicated to the probing.
@@ -569,9 +579,18 @@ data TCPParameters = TCPParameters {
     -- connection. Throwing an exception here will cause the server to
     -- terminate.
   , tcpServerExceptionHandler :: SomeException -> IO ()
-    -- | Enable TLS for Intra-EndPoint communication by specifying the
-    -- configuration for both TLS client and server endpoints.
-  , tcpTLS :: Maybe (TLSServerParams, TLSClientParams)
+    -- | TLS Server Parameters for establishing a 'Network.TLS.Context' with a
+    -- remote endpoint. The endpoint address of the client needs to be supplied
+    -- if the network is using a network-access-token with which the client
+    -- (remote endpoint requesting a connection) is to verify their identity
+    -- and their possession of the network-access-token.
+  , tcpTLSServerParams :: Maybe EndPointAddress -> IO TLS.ServerParams
+    -- | TLS Client Parameters for establishing a 'Network.TLS.Context' with a
+    -- remote endpoint. The endpoint address of the server must be supplied so
+    -- that the client can verify the CommonName of the TLS Certificate the
+    -- server responds with. The hostname of the endpoint address must match the
+    -- Common Name of the Certificate provided by the server.
+  , tcpTLSClientParams :: EndPointAddress -> IO TLS.ClientParams
   }
 
 -- | Internal functionality we expose for unit testing
@@ -686,9 +705,9 @@ createTransportExposeInternals addr params = do
       apiCloseTransport transport Nothing evs
 
 -- | Default TCP parameters
-defaultTCPParameters :: TCPParameters
-defaultTCPParameters = TCPParameters {
-    tcpBacklog         = N.sOMAXCONN
+defaultTCPParameters :: TLSConfig -> TCPParameters
+defaultTCPParameters TLSConfig{..} = TCPParameters
+  { tcpBacklog         = N.sOMAXCONN
   , tcpReuseServerAddr = True
   , tcpReuseClientAddr = True
   , tcpNoDelay         = False
@@ -700,6 +719,10 @@ defaultTCPParameters = TCPParameters {
   , tcpMaxReceiveLength = maxBound
   , tcpCheckPeerHost   = False
   , tcpServerExceptionHandler = throwIO
+  , tcpTLSServerParams =
+    mkTLSServerParams tlsSupported (mkShared tlsCertificateStore (Just tlsServerCredentials))
+  , tcpTLSClientParams =
+      mkTLSClientParams tlsSupported (mkShared tlsCertificateStore tlsClientCredentials)
   }
 
 --------------------------------------------------------------------------------
@@ -879,8 +902,8 @@ apiSend (ourEndPoint, theirEndPoint) connId connAlive payload =
         RemoteEndPointValid vst -> do
           alive <- readIORef connAlive
           if alive
-            then sched theirEndPoint $ do
-              sendOnWithTLS vst [encodeWord32 connId] (BS.concat payload)
+            then sched theirEndPoint $
+              sendOnWithTLS vst connId (BS.concat payload)
             else throwIO $ TransportError SendClosed "Connection closed"
         RemoteEndPointClosing _ _ -> do
           alive <- readIORef connAlive
@@ -1107,11 +1130,8 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
 
             -- Establish a TLS Server context since this is the endpoint
             -- receiving a connection request.
-            eServerParams <- mkTLSServerParams "server_cert.pem" "server_key.pem"
-            serverParams <- case eServerParams of
-              Left err -> throwIO (userError (show err))
-              Right serverParams' -> pure serverParams'
-            serverTLSContext <- TLS.contextNew sock serverParams
+            tlsServerParams <- tcpTLSServerParams (transportParams transport) Nothing
+            serverTLSContext <- TLS.contextNew sock tlsServerParams
 
             let vst = ValidRemoteEndPointState
                         {  remoteSocket        = sock
@@ -1126,14 +1146,24 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
                         }
             sendMany sock [encodeWord32 (encodeConnectionRequestResponse ConnectionRequestAccepted)]
 
-            -- Perform the TLS handshake on the remote endpoint's socket
-            tlsHandshake sendLock serverTLSContext
+            remoteEndPointState <- do
+              -- Perform the TLS handshake on the remote endpoint's socket,
+              -- catching exceptions that might occur
+              eHandshakeRes <-
+                handle handleTLSHandshakeFail $
+                  Right <$> tlsHandshake sendLock serverTLSContext
+              print "-------------------"
+              print eHandshakeRes
+              print "-------------------"
+              pure $ case eHandshakeRes of
+                Left err -> RemoteEndPointInvalid err
+                Right () -> RemoteEndPointValid vst
 
             -- resolveInit will update the shared state, and handleIncomingMessages
             -- will always ultimately clean up after it.
             -- Closing up the socket is also out of our hands. It will happen
             -- when handleIncomingMessages finishes.
-            resolveInit (ourEndPoint, theirEndPoint) (RemoteEndPointValid vst)
+            resolveInit (ourEndPoint, theirEndPoint) remoteEndPointState
               `finally`
               handleIncomingMessages (transportParams transport) (ourEndPoint, theirEndPoint)
 
@@ -1155,7 +1185,7 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
                 --
                 -- The thread handling incoming messages will detect the socket is
                 -- closed and will report the failure upwards.
-                tryCloseSocketTLS (remoteSocket vst) (remoteTLSContext vst)
+                tryCloseSocket (remoteSocket vst)
                 -- Waiting the probe ack and closing the socket is only needed in
                 -- platforms where TCP_USER_TIMEOUT is not available or when the
                 -- user does not set it. Otherwise the ack would be handled at the
@@ -1219,7 +1249,6 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
       lcid <- recvWord32 sock :: IO LightweightConnectionId
       if lcid >= firstNonReservedLightweightConnectionId
         then do
-          -- Read an encrypted message sent via TLS
           readMessage (tlsCtx, sock) lcid
           go tlsCtx sock
         else
@@ -1422,8 +1451,8 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
     -- should verify that the connection ID is valid, but this is unnecessary
     -- overhead
     readMessage :: (TLS.Context, N.Socket) -> LightweightConnectionId -> IO ()
-    readMessage tlsCtxAndSock lcid =
-      recvTLS tlsCtxAndSock recvLimit >>= \bs ->
+    readMessage (tlsCtx, sock) lcid = do
+      recvTLS (tlsCtx,sock) recvLimit >>= \bs ->
         qdiscEnqueue' ourQueue theirAddr (Received (connId lcid) [bs])
 
     -- Stop probing a connection as a result of receiving a probe ack.
@@ -1612,25 +1641,37 @@ setupRemoteEndPoint transport (ourEndPoint, theirEndPoint) connTimeout = do
 
         -- Establish a client TLS context with the endpoint since this
         -- endpoint is the one intiating the connection.
-        clientParams <- mkTLSClientParams theirAddress
-        clientTLSContext <- TLS.contextNew sock clientParams
-        putStrLn "Starting client handshake with server..."
-        tlsHandshake sendLock clientTLSContext
-        putStrLn "Finished handshake with server!"
+        eClientTLSContext <- do
+          handle handleTLSHandshakeFail $ do
+            tlsClientParams <- tcpTLSClientParams (transportParams transport) theirAddress
+            clientTLSContext <- TLS.contextNew sock tlsClientParams
+            -- Perform TLS handshake with server before setting up remote ep state
+            tlsHandshake sendLock clientTLSContext
+            pure $ Right clientTLSContext
 
-        let vst = ValidRemoteEndPointState
-                    {  remoteSocket        = sock
-                    ,  remoteTLSContext    = clientTLSContext
-                    ,  remoteSocketClosed  = readMVar socketClosedVar
-                    ,  remoteProbing       = Nothing
-                    ,  remoteSendLock      = sendLock
-                    , _remoteOutgoing      = 0
-                    , _remoteIncoming      = Set.empty
-                    , _remoteLastIncoming  = 0
-                    , _remoteNextConnOutId = firstNonReservedLightweightConnectionId
-                    }
-        resolveInit (ourEndPoint, theirEndPoint) (RemoteEndPointValid vst)
-        return (Just (socketClosedVar, sock))
+        case eClientTLSContext of
+          -- In the case that the TLS handshake failed, throw the exception and
+          -- close the socket; fail like the connection request wasn't accepted
+          Left err -> do
+            resolveInit (ourEndPoint, theirEndPoint) (RemoteEndPointInvalid err)
+            tryCloseSocket sock `finally` putMVar socketClosedVar ()
+            return Nothing
+          -- Otherwise create a valid remote endpoint
+          Right clientTLSContext -> do
+            let vst = ValidRemoteEndPointState
+                        {  remoteSocket        = sock
+                        ,  remoteTLSContext    = clientTLSContext
+                        ,  remoteSocketClosed  = readMVar socketClosedVar
+                        ,  remoteProbing       = Nothing
+                        ,  remoteSendLock      = sendLock
+                        , _remoteOutgoing      = 0
+                        , _remoteIncoming      = Set.empty
+                        , _remoteLastIncoming  = 0
+                        , _remoteNextConnOutId = firstNonReservedLightweightConnectionId
+                        }
+            resolveInit (ourEndPoint, theirEndPoint) (RemoteEndPointValid vst)
+            return (Just (socketClosedVar, sock))
+
       Right (socketClosedVar, sock, ConnectionRequestUnsupportedVersion) -> do
         -- If the peer doesn't support V0 then there's nothing we can do, for
         -- it's the only version we support.
@@ -1999,32 +2040,31 @@ sendOn :: ValidRemoteEndPointState -> [ByteString] -> IO ()
 sendOn vst bs = withMVar (remoteSendLock vst) $ \() ->
   sendMany (remoteSocket vst) bs
 
-sendOnWithTLS :: ValidRemoteEndPointState -> [ByteString] -> ByteString -> IO ()
-sendOnWithTLS vst bss bs =
-  withMVar (remoteSendLock vst) $ \() -> do
-    sendMany (remoteSocket vst) bss
-    sendTLS' (remoteTLSContext vst, remoteSocket vst) bs
 
--- | Send a message over a TLS connection given a 'Network.TLS.Context'. The
--- 'Network.TLS.Backend' object used by 'Network.TLS.sendData' from the
--- `Network.TLS.Context' is already set up to use the send lock, so we do not
--- have to guard this send with the send lock as in 'sendOn'.
+-- | Sends first the a control header designating to the remote transport which
+-- endpoint and connection the message is addressed to, the length of the
+-- message, and the message over the same socket. If TLS is enabled, the message
+-- is encrypted and only the remote endpoint it is addressed to will be able to
+-- decrypt the contents.
 --
--- This function first sends the length of the TLS packet so that the receiving
--- end can enforce that the packet is not larger than the desired
--- 'tcpMaxReceiveLength' configurable parameter.
---
--- This function is thread safe as it uses the send lock of the endpoint.
-sendTLS :: ValidRemoteEndPointState -> ByteString -> IO ()
-sendTLS vst bs =
+-- This function is thread safe as it uses the send lock of the endpoint, and
+-- will send the message without risk of the connection id and following
+-- message getting interleaved with messages sent by other threads.
+sendOnWithTLS
+  :: ValidRemoteEndPointState
+  -> LightweightConnectionId
+  -> ByteString
+  -> IO ()
+sendOnWithTLS vst connId bs =
   withMVar (remoteSendLock vst) $ \() -> do
-    sendTLS' (remoteTLSContext vst, remoteSocket vst) bs
+    let len = fromIntegral (BS.length bs)
+    sendMany (remoteSocket vst) [encodeWord32 connId, encodeWord32 len]
+    tlsErrToTransportErr (TransportError SendFailed . show) $
+      TLS.sendData (remoteTLSContext vst) (BSL.fromStrict bs)
 
--- | Raw TLS packet send.
---
--- This function first sends the length of the TLS packet so that the receiving
+-- | This function first sends the length of the TLS packet so that the receiving
 -- end can enforce that the packet is not larger than the desired
--- 'tcpMaxReceiveLength' configurable parameter.
+-- 'tcpMaxReceiveLength' configurable parameter. Mostly used in testing.
 --
 -- Warning: Does not use a send lock, so this function is not thread safe.
 sendTLS' :: (TLS.Context, N.Socket) -> ByteString -> IO ()
@@ -2184,25 +2224,89 @@ createConnectionId hcid lcid =
   (fromIntegral hcid `shiftL` 32) .|. fromIntegral lcid
 
 --------------------------------------------------------------------------------
--- TLS Internals
+-- TLS
 --------------------------------------------------------------------------------
 
-data TLSParams = TLSParams
-  { tlsSupported    :: Maybe TLS.Supported
-  , tlsServerParams :: TLSServerParams
-  , tlsClientParams :: TLSClientParams
-  , tlsCertificateStore :: FilePath
+--
+-- Extending the TCP transport model with TLS involves several additions to the
+-- previous TCP Transport model:
+--
+-- * When accepting a connection request from a remote endpoint (whether on the
+-- same Transport or not), a TLS Server Context and a TLS handshake are
+-- initiated before constructing the 'ValidRemoteEndPointState' pertaining to
+-- this connection. Any failures during this process are caught, and a
+-- 'RemoteEndpointInvalid' state is set such that the socket will be closed
+-- immediately by 'handleIncomingMessages'.
+--
+-- * After sending a connection request to a remote endpoint (whether on the
+-- same Transport or not), a TLS Client context and TLS handshake with the remote
+-- endpoing accepting the connection are initiated before marking the
+-- 'ValidRemoteEndPointState' from "init" to "resolved". Any failures that
+-- happen during the TLS handshake will cause the socket to be closed, just as
+-- other failures would.
+--
+-- * When sending non-control messages to remote endpoints, the local endpoint
+-- will use the TLS context (shared key) established when the TCP connection was
+-- being set up to encrypt the messages.
+--
+-- * When receiving non-control messages from remote endpoints, the local
+-- endpoint will use the TLS context (shared key) established when the TCP
+-- connection was being set up to encrypt the messages.
+--
+-- Most of the rest of the network-transport-tcp implementation has been left
+-- untouched, as TLS is a "layer on top of" TCP, and is not concerned with the
+-- properties of the underlying connection other than that it is reliable.
+--
+-- Note: In its current state, TLS on top of TCP is up to 2000x slower in some
+-- benchmarks. Further investigation is needed to determine the reasons.
+
+data TLSConfig = TLSConfig
+  { tlsSupported         :: TLS.Supported
+    -- ^ Supported TLS parameters like cipher suite, TLS version, etc.
+  , tlsServerCredentials :: TLS.Credentials
+    -- ^ TLS server credentials (Certificate filepath, PrivKey filepath)
+  , tlsCertificateStore  :: Maybe X509.CertificateStore
+    -- ^ Filepath of certificate store with which to verify TLS credentials when
+    -- supplying a "network-access-token' certificate with which client and
+    -- server TLS certificates must be signed.
+  , tlsClientCredentials :: Maybe TLS.Credentials
+    -- ^ Client Credentials (Certificate filepath, PrivKey filepath), only used when
+    -- supplying a "network-access-token" with which client and server
+    -- certificates must be signed.
   }
 
-data TLSServerParams = TLSServerParams
-  { tlsServerKeyFile  :: FilePath -- ^ FilePath to load the server private key from
-  , tlsServerCertFile :: FilePath -- ^ FilePath to load the server public key TLS certificate from
-  }
-
-data TLSClientParams = TLSClientParams
-  { tlsClientCredentials :: Maybe (FilePath, FilePath)
-    -- ^ FilePath to load the client private key and tls certificate from
-  }
+mkTLSConfig
+  :: TLS.Supported              -- ^ TLS Supported parameters
+  -> (FilePath, FilePath)       -- ^ Filepaths of Server Certificate and Private key
+  -> Maybe FilePath             -- ^ Filepath to certificate store
+  -> Maybe (FilePath, FilePath) -- ^ Filepaths to Client Certificate and Private key
+  -> IO (Either IOException TLSConfig)
+mkTLSConfig supported (serverCert,serverKey) mCertStoreFp mClientCredsFp = do
+  eServerCreds <- loadCredentials serverCert serverKey
+  case eServerCreds of
+    Left err -> pure (Left err)
+    Right serverCreds -> do
+      mCertStore <-
+        case mCertStoreFp of
+          Nothing -> pure Nothing
+          Just caStore -> X509.readCertificateStore caStore
+      eClientCreds <-
+        case mClientCredsFp of
+          Nothing -> pure (Right Nothing)
+          Just (clientCert, clientKey) -> do
+            eClientCreds' <- loadCredentials clientCert clientKey
+            case eClientCreds' of
+              Left err -> pure (Left err)
+              Right clientCreds -> pure (Right (Just clientCreds))
+      case eClientCreds of
+        Left err -> pure (Left err)
+        Right mClientCreds ->
+          pure $ Right $ TLSConfig
+          { tlsSupported         = supported
+          , tlsServerCredentials = serverCreds
+          , tlsCertificateStore  = mCertStore
+          , tlsClientCredentials = mClientCreds
+          }
 
 -- | Thread safe TLS handshake
 tlsHandshake :: MVar () -> TLS.Context -> IO ()
@@ -2211,42 +2315,64 @@ tlsHandshake sendLock tlsCtx =
     catch (TLS.handshake tlsCtx) $ \(e :: SomeException) ->
       throwIO (userError (show e))
 
-mkTLSServerParams :: FilePath -> FilePath -> IO (Either IOException TLS.ServerParams)
-mkTLSServerParams certFile keyFile = do
-  eServerCreds <- loadCredentials certFile keyFile
-  case eServerCreds of
-    Left err -> pure $ Left err
-    Right creds -> do
-      shared <- mkShared (Just creds)
-      pure $ Right def
-        { TLS.serverSupported = supported
-        , TLS.serverShared    = shared
-          -- Enable Ephemeral DH keys (forward secrecy)
-        , TLS.serverDHEParams = Just TLS.ffdhe4096
-        , TLS.serverHooks     = serverHooks
-        }
+-- | Creates TLS Server Parameters. The Common name supplied to this function
+-- should match the common name on the client certificate, if using a
+-- network-access-token.
+mkTLSServerParams
+  :: TLS.Supported    -- ^ Supported TLS parameters like cipher suite, TLS version, etc.
+  -> TLS.Shared       -- ^ Parameters shared with Client to prove identity
+  -> Maybe EndPointAddress
+     -- ^ EndPointAddress of the Client end point. Their hostname must match their
+     -- certificate's common name. TLS Credentials for TCP/TLS Transports should
+     -- be generated in 'createTransport' based on the resolved Transport hostname
+  -> IO TLS.ServerParams
+mkTLSServerParams supported serverShared mClientAddr = do
+    mClientHostname <-
+      case decodeEndPointAddress <$> mClientAddr of
+        Nothing                            -> throwIO decodeFailure
+        Just Nothing                       -> pure Nothing
+        Just (Just (clientHostname, _, _)) -> return $ Just clientHostname
+    pure def
+      { TLS.serverSupported = supported
+      , TLS.serverShared    = serverShared
+        -- Enable Ephemeral DH keys (forward secrecy)
+      , TLS.serverDHEParams = Just TLS.ffdhe4096
+        -- If the client's common name is supplied, then we will send them a
+        -- certificate request, validating the client's response in several
+        -- ways, one of which is verifying the common name on their tls cert
+        -- matches the the common name we expect.
+      , TLS.serverHooks     = maybe def serverHooks mClientHostname
+      }
   where
-    -- Used when validating a client certificate signed by a network access
-    -- token.
-    serverHooks :: TLS.ServerHooks
-    serverHooks = def
+    -- Used when validating a client certificate signed by a network access token.
+    serverHooks :: X509.HostName -> TLS.ServerHooks
+    serverHooks clientCommonNm = def
       { TLS.onClientCertificate = \certChain -> do
-          fres <- validateDefault mempty def ("Uplink", mempty) certChain
-          pure $ case filter (/= SelfSigned) fres of
+          fres <- X509.validateDefault mempty def (clientCommonNm, mempty) certChain
+          pure $ case filter (/= X509.SelfSigned) fres of
             []    -> TLS.CertificateUsageAccept
             (X509.Expired:_)   -> TLS.CertificateUsageReject TLS.CertificateRejectExpired
             (X509.UnknownCA:_) -> TLS.CertificateUsageReject TLS.CertificateRejectUnknownCA
             (reason:_)    -> TLS.CertificateUsageReject (TLS.CertificateRejectOther (show reason))
       }
 
+    decodeFailure = TransportError ConnectFailed "Invalid Client EndpointAddress"
+
 -- | Make TLS Client Parameters. The server hostname to connect to must be
 -- supplied, and match the Common Name specified on the TLS Certificate used by
 -- the server. In practice, the host name supplied must match the Common Name on
 -- the SSL Certificate provided by the TLS server in which this client will
 -- connect to. This can be accomplished by supplying the 'HostName' argument
-mkTLSClientParams :: EndPointAddress -> IO TLS.ClientParams
-mkTLSClientParams serverEndPointAddr = do
-  shared <- mkShared Nothing -- No client credentials
+mkTLSClientParams
+  :: TLS.Supported    -- ^ Supported TLS parameters like cipher suite, TLS version, etc.
+  -> TLS.Shared       -- ^ Parameters shared with Server to prove identity
+  -> EndPointAddress  -- ^ Endpoint address with which to connect.
+  -> IO TLS.ClientParams
+mkTLSClientParams supported shared serverEndPointAddr = do
+  serverHostname <-
+    case decodeEndPointAddress serverEndPointAddr of
+      Nothing  -> throwIO decodeFailure
+      Just (serverHostname, _, _) -> return serverHostname
   pure $ (TLS.defaultParamsClient serverHostname "")
     { TLS.clientSupported = supported
     , TLS.clientHooks     = clientHooks
@@ -2255,20 +2381,19 @@ mkTLSClientParams serverEndPointAddr = do
   where
     clientHooks :: TLS.ClientHooks
     clientHooks = def
-        { -- TLS.onCertificateRequest = \_ ->
+        { -- TODO TLS.onCertificateRequest = \_ ->
+          -- Respond with credentials here ((Certificate, PrivKey))
           TLS.onServerCertificate  = \cs vc cid ->
             fmap ignoreSelfSigned . onServerCert cs vc cid
         }
       where
         onServerCert = TLS.onServerCertificate def
         -- For the moment, we ignore self-signed certificate errors, because
-        -- endpoints do not need
+        -- endpoints do not need certificate authorities to verify their
+        -- identity.
         ignoreSelfSigned = filter (/= X509.SelfSigned)
 
-    (serverHostname, _, _) =
-      case decodeEndPointAddress serverEndPointAddr of
-        Nothing  -> throwIO (failed . userError $ "Could not parse")
-        Just dec -> return dec
+    decodeFailure = TransportError ConnectFailed "Invalid Server EndpointAddress"
 
 -- | The default TLS parameters supported by endpoints. Parameters can contain
 -- only a single value because each endpoint using network-transport will
@@ -2277,31 +2402,38 @@ mkTLSClientParams serverEndPointAddr = do
 -- entities, override these defaults with a wider range of options.
 defaultSupported :: TLS.Supported
 defaultSupported = def
-  { TLS.supportedCiphers  = [cipher_ECDHE_ECDSA_AES256GCM_SHA384]
+  { TLS.supportedCiphers  = [TLS.cipher_ECDHE_ECDSA_AES256GCM_SHA384]
   , TLS.supportedVersions = [TLS.TLS12]
   , TLS.supportedGroups   = [TLS.X25519]
   }
 
--- Load TLS Server or TLS Client credentials
+-- | Load TLS Server or Client credentials
 loadCredentials :: FilePath -> FilePath -> IO (Either IOException TLS.Credentials)
 loadCredentials certFile keyFile = do
   eCred <- TLS.credentialLoadX509 certFile keyFile
   pure $ case eCred of
-    Left err   -> Left $ userError $ "Failed to load server credentials: " ++ err
+    Left err   -> Left $ userError $ "Failed to load tls credentials: " ++ err
     Right cred -> Right $ TLS.Credentials [cred]
 
 -- | Must provide credentials if making a 'Shared' value for a TLS server
--- TODO Figure out if client credentials are ever necessary
-mkShared :: Maybe FilePath -> Maybe TLS.Credentials -> IO TLS.Shared
-mkShared mCAStore mCreds = do
-  mCertStore <-
-    case mCAStore of
-      Nothing -> pure Nothing
-      Just caStore -> X509.readCertificateStore caStore
-  pure def
-    { TLS.sharedCredentials = fromMaybe mempty mCreds
-    , TLS.sharedCAStore = fromMaybe mempty mCertStore
-    }
+-- In Network.Transport applications, these credentials can include a
+-- self-signed certificate if no network access token is supplied.
+-- -- TODO Figure out if client credentials are ever necessary
+mkShared :: Maybe X509.CertificateStore -> Maybe TLS.Credentials -> TLS.Shared
+mkShared mCAStore mCreds = def
+  { TLS.sharedCredentials = fromMaybe mempty mCreds
+  , TLS.sharedCAStore = fromMaybe mempty mCAStore
+  }
+
+-- | Turn a TLSError into a TransportError
+tlsErrToTransportErr
+  :: (Show e, Typeable e)
+  => (TLS.TLSError -> TransportError e)
+  -> IO a -> IO a
+tlsErrToTransportErr f p = catch p (throwIO . f)
+
+handleTLSHandshakeFail :: TLS.TLSError -> IO (Either (TransportError ConnectErrorCode) a)
+handleTLSHandshakeFail = pure . Left . TransportError ConnectFailed . show
 
 --------------------------------------------------------------------------------
 -- Functions from TransportInternals                                          --
