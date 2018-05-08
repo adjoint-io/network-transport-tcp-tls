@@ -1,5 +1,7 @@
 # network-transport-tcp-tls
 
+[![CircleCI](https://circleci.com/gh/adjoint-io/network-transport-tcp-tls.svg?style=svg&circle-token=5f583c222bdd72844749fdf3a82a2900a5f93d86)](https://circleci.com/gh/adjoint-io/network-transport-tcp-tls)
+
 A network-transport Tranport realisation using TCP and TLS
 
 See http://haskell-distributed.github.com for documentation, user guides,
