@@ -180,7 +180,7 @@ tlsHandshakeClient clientParams sock clientAddr = do
   let ourAddrPref = "(" ++ show clientAddr ++ ") "
   let tlsHandshake = do
         tlog $ ourAddrPref ++ "Starting client TLS handshake..."
-        TLS.contextModifyHooks clientTLSContext (addLoggingHooks "T-CLIENT")
+        -- TLS.contextModifyHooks clientTLSContext (addLoggingHooks "T-CLIENT")
         TLS.handshake clientTLSContext
         tlog $ ourAddrPref ++ "Finished client TLS handshake."
   () <- tlsHandshake
@@ -193,7 +193,7 @@ tlsHandshakeServer serverParams sock serverAddr = do
   let ourAddrPref = "(" ++ "client" ++ ") "
   let tlsHandshake = do
         tlog $ ourAddrPref ++ "Starting server TLS handshake..."
-        TLS.contextModifyHooks serverTLSContext (addLoggingHooks "T-SERVER")
+        -- TLS.contextModifyHooks serverTLSContext (addLoggingHooks "T-SERVER")
         TLS.handshake serverTLSContext
         tlog $ ourAddrPref ++ "Finished server TLS handshake."
   () <- tlsHandshake
