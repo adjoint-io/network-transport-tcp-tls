@@ -17,7 +17,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RecordWildCards #-}
 
-module Network.Transport.TCP
+module Network.Transport.TCP.TLS
   ( -- * Main API
     createTransport
   , TCPAddr(..)
@@ -93,7 +93,6 @@ import Network.Transport.Internal
   ( prependLength
   , mapIOException
   , tryIO
-  , tryToEnum
   , void
   , timeoutMaybe
   , asyncWhenCancelled
@@ -128,9 +127,9 @@ import qualified Data.X509.Validation as X509
 import qualified Data.X509.CertificateStore as X509
 
 #ifdef USE_MOCK_NETWORK
-import Network.Transport.TCP.Mock.Socket.ByteString (sendMany, sendAll)
+import Network.Transport.TCP.Mock.Socket.ByteString (sendMany)
 #else
-import Network.Socket.ByteString (sendMany, sendAll)
+import Network.Socket.ByteString (sendMany)
 #endif
 
 import Control.Concurrent
@@ -174,12 +173,12 @@ import Control.Exception
   )
 import Data.IORef (IORef, newIORef, writeIORef, readIORef, writeIORef)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS (concat, append, length, null, empty, splitAt, cons)
+import qualified Data.ByteString as BS (concat, length, null)
 import qualified Data.ByteString.Char8 as BSC (pack, unpack)
 import qualified Data.ByteString.Lazy as BSL
 import Data.Bits (shiftL, (.|.))
 import Data.Default (def)
-import Data.Maybe (isJust, fromMaybe, maybeToList)
+import Data.Maybe (isJust, fromMaybe)
 import Data.Word (Word32)
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -857,8 +856,6 @@ apiConnect transport ourEndPoint theirAddress _reliability hints =
           { send  = apiSend  (ourEndPoint, theirEndPoint) connId connAlive
           , close = apiClose (ourEndPoint, theirEndPoint) connId connAlive
           }
-  where
-  params = transportParams transport
 
 -- | Close a connection
 apiClose :: EndPointPair -> LightweightConnectionId -> IORef Bool -> IO ()
@@ -1061,7 +1058,7 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
     handleConnectionRequestV0 :: (N.Socket, N.SockAddr) -> IO (Maybe (IO ()))
     handleConnectionRequestV0 (sock, sockAddr) = do
       -- Get the OS-determined host and port.
-      (numericHost, resolvedHost, actualPort) <-
+      (numericHost, resolvedHost, _) <-
         resolveSockAddr sockAddr >>=
           maybe (throwIO (userError "handleConnectionRequest: invalid socket address")) return
       -- The peer must send our identifier and their address promptly, if a
@@ -1203,7 +1200,7 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
 -- This runs in a thread that will never be killed.
 handleIncomingMessages :: TCPParameters -> EndPointPair -> IO ()
 handleIncomingMessages params (ourEndPoint, theirEndPoint) =
-    bracket acquire release act
+    bracket acquire release handleMessages
 
   where
 
@@ -1233,9 +1230,9 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
     release (Left err) = prematureExit err
     release (Right _) = return ()
 
-    act :: Either IOError (TLS.Context, N.Socket) -> IO ()
-    act (Left _) = return ()
-    act (Right (tlsCtx, sock)) = go tlsCtx sock `catch` prematureExit
+    handleMessages :: Either IOError (TLS.Context, N.Socket) -> IO ()
+    handleMessages (Left _) = return ()
+    handleMessages (Right (tlsCtx, sock)) = go tlsCtx sock `catch` prematureExit
 
     -- Dispatch
     --
@@ -1261,7 +1258,7 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
               recvWord32 sock >>= closeConnection
               go tlsCtx sock
             Just CloseSocket -> do
-              didClose <- recvWord32 sock >>= closeSocket sock
+              didClose <- recvWord32 sock >>= closeSocket
               unless didClose $ go tlsCtx sock
             Just CloseEndPoint -> do
               let closeRemoteEndPoint vst = do
@@ -1359,8 +1356,8 @@ handleIncomingMessages params (ourEndPoint, theirEndPoint) =
       qdiscEnqueue' ourQueue theirAddr (ConnectionClosed (connId lcid))
 
     -- Close the socket (if we don't have any outgoing connections)
-    closeSocket :: N.Socket -> LightweightConnectionId -> IO Bool
-    closeSocket sock lastReceivedId = do
+    closeSocket :: LightweightConnectionId -> IO Bool
+    closeSocket lastReceivedId = do
       mAct <- modifyMVar theirState $ \st -> do
         case st of
           RemoteEndPointInvalid _ ->
@@ -2090,10 +2087,6 @@ recvTLS (tlsCtx, sock) recvLimit = do
     throwIO (userError "recvTLS: limit exceeded")
   TLS.recvData tlsCtx
 
-tryCloseSocketTLS :: N.Socket -> TLS.Context -> IO ()
-tryCloseSocketTLS sock ctx =
-  TLS.bye ctx >> tryCloseSocket sock
-
 --------------------------------------------------------------------------------
 -- Scheduling actions                                                         --
 --------------------------------------------------------------------------------
@@ -2120,7 +2113,7 @@ schedule theirEndPoint act = do
 -- However, it will then wait until @p@ is executed (by this call to
 -- 'runScheduledAction' or by another).
 runScheduledAction :: EndPointPair -> Action a -> IO a
-runScheduledAction (ourEndPoint, theirEndPoint) mvar = do
+runScheduledAction (_, theirEndPoint) mvar = do
     join $ readChan (remoteScheduled theirEndPoint)
     ma <- readMVar mvar
     case ma of
@@ -2409,8 +2402,8 @@ mkTLSClientParams supported shared serverEndPointAddr = do
 -- entities, override these defaults with a wider range of options.
 defaultSupported :: TLS.Supported
 defaultSupported = def
-  { TLS.supportedCiphers  = TLS.ciphersuite_dhe_rsa
-  , TLS.supportedVersions = [TLS.TLS12]
+  { TLS.supportedCiphers  = TLS.ciphersuite_dhe_rsa -- 7
+  , TLS.supportedVersions = [TLS.TLS12]     -- Use the latest version of TLS
   , TLS.supportedGroups   = [TLS.FFDHE4096] -- FFDHE4096 necessary when server using DH ephermeral RSA
   }
 

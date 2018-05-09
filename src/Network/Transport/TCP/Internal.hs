@@ -49,7 +49,7 @@ import qualified Network.Socket as N
   , getAddrInfo
   , defaultHints
   , socket
-  , bindSocket
+  , bind
   , listen
   , addrFamily
   , addrAddress
@@ -66,12 +66,10 @@ import qualified Network.Socket as N
   )
 
 #ifdef USE_MOCK_NETWORK
-import qualified Network.Transport.TCP.Mock.Socket.ByteString as NBS (recv, sendMany)
+import qualified Network.Transport.TCP.Mock.Socket.ByteString as NBS (recv)
 #else
-import qualified Network.Socket.ByteString as NBS (recv, sendMany)
+import qualified Network.Socket.ByteString as NBS (recv)
 #endif
-
-import Data.Word (Word32, Word64)
 
 import Control.Monad (forever, when)
 import Control.Exception (SomeException, catch, bracketOnError, throwIO, mask_)
@@ -82,27 +80,17 @@ import Control.Concurrent.MVar
   , putMVar
   , readMVar
   )
-import Control.Monad (forever, when)
 import Control.Exception
-  ( SomeException
-  , catch
-  , bracketOnError
-  , throwIO
-  , mask_
-  , mask
+  ( mask
   , finally
-  , onException
   )
 
 import Control.Applicative ((<$>), (<*>))
 import Data.Word (Word32)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as BS (length, concat, null, empty, splitAt)
+import qualified Data.ByteString as BS (length, concat, null)
 import Data.ByteString.Lazy.Internal (smallChunkSize)
-import Data.ByteString.Lazy (toStrict)
 import qualified Data.ByteString.Char8 as BSC (unpack, pack)
-import Data.ByteString.Lazy.Builder (word64BE, toLazyByteString)
-import Data.Monoid ((<>))
 import qualified Data.UUID as UUID
 import qualified Data.UUID.V4 as UUID
 
@@ -165,7 +153,6 @@ data ConnectionRequestResponse =
     -- | /A/ gave an incorrect host (did not match the host that /B/ observed).
   | ConnectionRequestHostMismatch
     -- | /B/ Is waiting for /A/ to start a TLS handshake
-  | TLSHandshake
   deriving (Show)
 
 decodeConnectionRequestResponse :: Word32 -> Maybe ConnectionRequestResponse
@@ -175,7 +162,6 @@ decodeConnectionRequestResponse w32 = case w32 of
   0x00000001 -> Just ConnectionRequestInvalid
   0x00000002 -> Just ConnectionRequestCrossed
   0x00000003 -> Just ConnectionRequestHostMismatch
-  0x00000004 -> Just TLSHandshake
   _          -> Nothing
 
 encodeConnectionRequestResponse :: ConnectionRequestResponse -> Word32
@@ -185,7 +171,6 @@ encodeConnectionRequestResponse crr = case crr of
   ConnectionRequestInvalid            -> 0x00000001
   ConnectionRequestCrossed            -> 0x00000002
   ConnectionRequestHostMismatch       -> 0x00000003
-  TLSHandshake                        -> 0x00000004
 
 -- | Generate an EndPointAddress which does not encode a host/port/endpointid.
 -- Such addresses are used for unreachable endpoints, and for ephemeral
@@ -239,7 +224,7 @@ forkServer host port backlog reuseAddr errorHandler terminationHandler requestHa
     bracketOnError (N.socket (N.addrFamily addr) N.Stream N.defaultProtocol)
                    tryCloseSocket $ \sock -> do
       when reuseAddr $ N.setSocketOption sock N.ReuseAddr 1
-      N.bindSocket sock (N.addrAddress addr)
+      N.bind sock (N.addrAddress addr)
       N.listen sock backlog
 
       -- Close up and fill the synchonizing MVar.
