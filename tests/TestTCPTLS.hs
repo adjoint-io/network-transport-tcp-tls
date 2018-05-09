@@ -16,7 +16,7 @@ import Prelude hiding
 #endif
   )
 import Network.Transport
-import Network.Transport.TCP ( createTransport
+import Network.Transport.TCP.TLS ( createTransport
                              , createTransportExposeInternals
                              , TransportInternals(..)
                              , TCPParameters(..)
@@ -25,6 +25,7 @@ import Network.Transport.TCP ( createTransport
                              , TCPAddrInfo(..)
                              , TCPAddr(..)
                              , defaultTCPAddr
+                             , socketToEndPoint
 
                              , TLSConfig
                              , mkTLSConfig
@@ -53,7 +54,6 @@ import Control.Concurrent.MVar ( MVar
 import Control.Monad (replicateM, guard, forM_, replicateM_, when)
 import Control.Applicative ((<$>))
 import Control.Exception (throwIO, try, SomeException, catch, IOException)
-import Network.Transport.TCP ( socketToEndPoint )
 import Network.Transport.Internal ( prependLength
                                   , tryIO
                                   , void
@@ -1046,20 +1046,13 @@ testUseRandomPort :: IO ()
 testUseRandomPort = do
    testDone <- newEmptyMVar
    forkTry $ do
-     putStrLn "11111"
      Right transport1 <- createTransport (defaultTCPAddr "127.0.0.1" "0") =<< testTCPParametersTLS
-     putStrLn "22222"
      Right ep1        <- newEndPoint transport1
-     putStrLn "33333"
      -- Same as transport1, but is strict in the port.
      Right transport2 <- createTransport (Addressable (TCPAddrInfo "127.0.0.1" "0" (\(!port) -> ("127.0.0.1", port)))) =<< testTCPParametersTLS
-     putStrLn "44444"
      Right ep2        <- newEndPoint transport2
-     putStrLn "55555"
      Right conn1 <- connect ep2 (address ep1) ReliableOrdered defaultConnectHints
-     putStrLn "66666"
      ConnectionOpened _ _ _ <- receive ep1
-     putStrLn "77777"
      putMVar testDone ()
    takeMVar testDone
 
