@@ -123,6 +123,7 @@ import qualified Network.Socket as N
 
 import qualified Network.TLS as TLS
 import qualified Network.TLS.Extra as TLS
+import qualified Data.X509 as X509
 import qualified Data.X509.Validation as X509
 import qualified Data.X509.CertificateStore as X509
 
@@ -1151,6 +1152,7 @@ handleConnectionRequest transport socketClosed (sock, sockAddr) = handle handleE
               -- catching exceptions that might occur
               eHandshakeRes <-
                 handle handleTLSHandshakeFail $ do
+                  -- For Debugging, TODO make tls config flag for debugging output
                   -- TLS.contextModifyHooks serverTLSContext (addLoggingHooks "Server")
                   Right <$> tlsHandshake sendLock serverTLSContext
               pure $ case eHandshakeRes of
@@ -1646,9 +1648,16 @@ setupRemoteEndPoint transport (ourEndPoint, theirEndPoint) connTimeout = do
             Right tlsClientParams -> do
               -- Perform TLS handshake with server before setting up remote ep state
               clientTLSContext <- TLS.contextNew sock tlsClientParams
-              -- TLS.contextModifyHooks clientTLSContext (addLoggingHooks "Client")
-              tlsHandshake sendLock clientTLSContext
-              pure $ Right clientTLSContext
+              -- Exceptions thrown in this function are sometimes ignored by the
+              -- caller functions. We need to fail hard here, signifying failure
+              -- so that the EndPoint state gets set to invalid later in this function.
+              eHandshakeRes <- handle handleTLSHandshakeFail $ do
+                -- For Debugging, TODO make tls config flag for debugging output
+                TLS.contextModifyHooks clientTLSContext (addLoggingHooks "Client")
+                Right <$> tlsHandshake sendLock clientTLSContext
+              pure $ case eHandshakeRes of
+                Left err -> Left err
+                Right () -> Right clientTLSContext
 
         case eClientTLSContext of
           -- In the case that the TLS handshake failed, throw the exception and
@@ -2386,15 +2395,23 @@ mkTLSClientParams supported shared serverEndPointAddr = do
     clientHooks = def
         { -- TODO TLS.onCertificateRequest = \_ ->
           -- Respond with credentials here ((Certificate, PrivKey))
-          TLS.onServerCertificate  = \cs vc cid ->
-            fmap ignoreSelfSigned . onServerCert cs vc cid
+          TLS.onServerCertificate  =
+            X509.validate X509.HashSHA256 validationHooks def
         }
       where
-        onServerCert = TLS.onServerCertificate def
         -- For the moment, we ignore self-signed certificate errors, because
         -- endpoints do not need certificate authorities to verify their
-        -- identity.
-        ignoreSelfSigned = filter (/= X509.SelfSigned)
+        -- identity, nor do we need the Common Name's on their certificate to
+        -- match their current host names
+        --
+        -- TODO Confirm this is true
+        validationHooks = def
+          { X509.hookFilterReason = filter $ \res ->
+              case res of
+                X509.NameMismatch _ -> False
+                X509.SelfSigned -> False
+                _ -> True
+          }
 
     decodeFailure = TransportError ConnectFailed "Invalid Server EndpointAddress"
 

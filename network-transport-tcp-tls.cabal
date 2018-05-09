@@ -34,6 +34,7 @@ Library
                    tls >= 1.4.1 && < 1.5,
                    x509-validation >=1.6.5,
                    x509-store >=1.6.6,
+                   x509 >= 1.7.2,
                    data-default,
                    protolude
   Exposed-modules: Network.Transport.TCP.TLS,
