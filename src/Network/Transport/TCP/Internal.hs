@@ -152,7 +152,6 @@ data ConnectionRequestResponse =
   | ConnectionRequestCrossed
     -- | /A/ gave an incorrect host (did not match the host that /B/ observed).
   | ConnectionRequestHostMismatch
-    -- | /B/ Is waiting for /A/ to start a TLS handshake
   deriving (Show)
 
 decodeConnectionRequestResponse :: Word32 -> Maybe ConnectionRequestResponse
