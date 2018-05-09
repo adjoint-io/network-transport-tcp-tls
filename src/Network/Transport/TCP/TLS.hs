@@ -2377,6 +2377,9 @@ mkTLSClientParams supported shared serverEndPointAddr = do
         { TLS.clientSupported = supported
         , TLS.clientHooks     = clientHooks
         , TLS.clientShared    = shared
+        -- For use within cloud haskell, we don't always know what host we are
+        -- connecting to. Client will auth server by verifying it's signature.
+        , TLS.clientUseServerNameIndication = False
         }
   where
     clientHooks :: TLS.ClientHooks
