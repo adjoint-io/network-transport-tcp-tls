@@ -4,9 +4,9 @@ Cabal-Version: >=1.10
 Build-Type:    Simple
 License:       BSD3
 License-file:  LICENSE
-Copyright:     Well-Typed LLP, Tweag I/O Limited
+Copyright:     Well-Typed LLP, Tweag I/O Limited, Adjoint Inc
 Author:        Duncan Coutts, Nicolas Wu, Edsko de Vries
-maintainer:    Thomas Dietert <thomas@adjoint.io>
+maintainer:    Adjoint Inc. <info@adjoint.io>
 Stability:     experimental
 Homepage:      http://haskell-distributed.github.com
 Synopsis:      TCP+TLS instantiation of Network.Transport
