@@ -1653,7 +1653,7 @@ setupRemoteEndPoint transport (ourEndPoint, theirEndPoint) connTimeout = do
               -- so that the EndPoint state gets set to invalid later in this function.
               eHandshakeRes <- handle handleTLSHandshakeFail $ do
                 -- For Debugging, TODO make tls config flag for debugging output
-                TLS.contextModifyHooks clientTLSContext (addLoggingHooks "Client")
+                -- TLS.contextModifyHooks clientTLSContext (addLoggingHooks "Client")
                 Right <$> tlsHandshake sendLock clientTLSContext
               pure $ case eHandshakeRes of
                 Left err -> Left err
