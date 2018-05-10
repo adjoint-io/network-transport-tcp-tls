@@ -41,7 +41,7 @@ packages:
 # (e.g., acme-missiles-0.3)
 extra-deps: 
 - git: git@github.com:adjoint-io/network-transport-tests.git
-  commit: 208a1d12ecd9f0c123eaae0c62835b8509564aa5
+  commit: 15e6c730a4b46c0783da41c896ae4b93d3dfbde8 
 
   # Override default flag values for local packages and extra-deps
 # flags: {}
