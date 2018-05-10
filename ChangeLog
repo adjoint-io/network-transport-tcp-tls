@@ -1,9 +1,7 @@
-next release
+2018-05-09 Thomas Dietert <thomas@adjoint.io> 0.1.0
 
-* Added support for unaddressable endpoints. (#61)
-* apiSend RELY violation is removed for closed remote endpoints (#70)
-* The server no longer needs crash if accept throws an exception.
-* Check peer-reported host against socket host (#54)
+* Renamed library to 'network-transport-tcp-tls'
+* Implemented TLS handshake and message encryption for endpoint connections
 
 2017-08-21 FacundoDominguez <facundo.dominguez@tweag.io> 0.6.0
 
