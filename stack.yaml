@@ -15,7 +15,7 @@
 # resolver:
 #  name: custom-snapshot
 #  location: "./custom-snapshot.yaml"
-resolver: lts-11.7
+resolver: lts-13.11
 
 # User packages to be built.
 # Various formats can be used as shown in the example below.
@@ -39,9 +39,9 @@ packages:
 - .
 # Dependency packages to be pulled from upstream that are not in the resolver
 # (e.g., acme-missiles-0.3)
-extra-deps: 
+extra-deps:
 - git: git@github.com:adjoint-io/network-transport-tests.git
-  commit: 15e6c730a4b46c0783da41c896ae4b93d3dfbde8 
+  commit: 7173a2118055fa8249d7af9278f5c8ec5dca338b
 
   # Override default flag values for local packages and extra-deps
 # flags: {}
